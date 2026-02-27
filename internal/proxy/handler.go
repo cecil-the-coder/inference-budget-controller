@@ -20,7 +20,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -645,7 +644,7 @@ func (s *Server) handleStreamingResponse(c *gin.Context, resp *http.Response) {
 		}
 
 		if _, err := c.Writer.WriteString(line); err != nil {
-			s.Logger.Error(err, "Failed to write streaming response")
+			log.FromContext(c.Request.Context()).Error(err, "Failed to write streaming response")
 		}
 		flusher.Flush()
 	}
@@ -677,7 +676,7 @@ func (s *Server) handleNonStreamingResponse(c *gin.Context, resp *http.Response)
 	}
 
 	if _, err := c.Writer.Write(body); err != nil {
-		s.Logger.Error(err, "Failed to write response body")
+		log.FromContext(c.Request.Context()).Error(err, "Failed to write response body")
 	}
 }
 

@@ -18,47 +18,11 @@ package proxy
 
 import "time"
 
-// ChatCompletionRequest represents an OpenAI chat completion request
-type ChatCompletionRequest struct {
-	Model            string         `json:"model"`
-	Messages         []ChatMessage  `json:"messages"`
-	Temperature      *float64       `json:"temperature,omitempty"`
-	TopP             *float64       `json:"top_p,omitempty"`
-	N                *int           `json:"n,omitempty"`
-	Stream           bool           `json:"stream,omitempty"`
-	Stop             interface{}    `json:"stop,omitempty"`
-	MaxTokens        *int           `json:"max_tokens,omitempty"`
-	PresencePenalty  *float64       `json:"presence_penalty,omitempty"`
-	FrequencyPenalty *float64       `json:"frequency_penalty,omitempty"`
-	LogitBias        map[string]int `json:"logit_bias,omitempty"`
-	User             string         `json:"user,omitempty"`
-}
-
-// ChatMessage represents a message in a chat completion
-type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	Name    string `json:"name,omitempty"`
-}
-
-// CompletionRequest represents an OpenAI completion request
-type CompletionRequest struct {
-	Model            string         `json:"model"`
-	Prompt           interface{}    `json:"prompt"`
-	Suffix           string         `json:"suffix,omitempty"`
-	MaxTokens        *int           `json:"max_tokens,omitempty"`
-	Temperature      *float64       `json:"temperature,omitempty"`
-	TopP             *float64       `json:"top_p,omitempty"`
-	N                *int           `json:"n,omitempty"`
-	Stream           bool           `json:"stream,omitempty"`
-	Logprobs         *int           `json:"logprobs,omitempty"`
-	Echo             bool           `json:"echo,omitempty"`
-	Stop             interface{}    `json:"stop,omitempty"`
-	PresencePenalty  *float64       `json:"presence_penalty,omitempty"`
-	FrequencyPenalty *float64       `json:"frequency_penalty,omitempty"`
-	BestOf           *int           `json:"best_of,omitempty"`
-	LogitBias        map[string]int `json:"logit_bias,omitempty"`
-	User             string         `json:"user,omitempty"`
+// inferenceRequest extracts only the fields the proxy needs from any
+// OpenAI-compatible request body. The full body is forwarded as raw bytes.
+type inferenceRequest struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
 }
 
 // ErrorResponse represents an OpenAI error response
@@ -87,30 +51,6 @@ type ModelInfo struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
-}
-
-// ChatCompletionResponse represents a chat completion response
-type ChatCompletionResponse struct {
-	ID      string       `json:"id"`
-	Object  string       `json:"object"`
-	Created int64        `json:"created"`
-	Model   string       `json:"model"`
-	Choices []ChatChoice `json:"choices"`
-	Usage   UsageInfo    `json:"usage"`
-}
-
-// ChatChoice represents a choice in chat completion
-type ChatChoice struct {
-	Index        int         `json:"index"`
-	Message      ChatMessage `json:"message"`
-	FinishReason string      `json:"finish_reason"`
-}
-
-// UsageInfo represents token usage information
-type UsageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
 }
 
 // InsufficientMemoryDetails contains details about memory allocation failure
@@ -169,74 +109,6 @@ func NewInsufficientMemoryResponse(modelName, memoryReq, availableMem string, bl
 			},
 		},
 	}
-}
-
-// StreamingChatCompletionChunk represents a streaming response chunk
-type StreamingChatCompletionChunk struct {
-	ID      string                     `json:"id"`
-	Object  string                     `json:"object"`
-	Created int64                      `json:"created"`
-	Model   string                     `json:"model"`
-	Choices []StreamingChatChoiceChunk `json:"choices"`
-}
-
-// StreamingChatChoiceChunk represents a choice in streaming response
-type StreamingChatChoiceChunk struct {
-	Index        int              `json:"index"`
-	Delta        ChatMessageDelta `json:"delta"`
-	FinishReason *string          `json:"finish_reason,omitempty"`
-}
-
-// ChatMessageDelta represents a partial message in streaming
-type ChatMessageDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
-}
-
-// CompletionResponse represents a legacy completion response
-type CompletionResponse struct {
-	ID      string             `json:"id"`
-	Object  string             `json:"object"`
-	Created int64              `json:"created"`
-	Model   string             `json:"model"`
-	Choices []CompletionChoice `json:"choices"`
-	Usage   UsageInfo          `json:"usage"`
-}
-
-// CompletionChoice represents a choice in completion response
-type CompletionChoice struct {
-	Text         string    `json:"text"`
-	Index        int       `json:"index"`
-	FinishReason string    `json:"finish_reason"`
-	Logprobs     *Logprobs `json:"logprobs,omitempty"`
-}
-
-// Logprobs represents log probability information
-type Logprobs struct {
-	Tokens        []string             `json:"tokens,omitempty"`
-	TokenLogprobs []float64            `json:"token_logprobs,omitempty"`
-	TopLogprobs   []map[string]float64 `json:"top_logprobs,omitempty"`
-	TextOffset    []int                `json:"text_offset,omitempty"`
-}
-
-// GetModelName extracts the model name from a chat completion request
-func (r *ChatCompletionRequest) GetModelName() string {
-	return r.Model
-}
-
-// GetModelName extracts the model name from a completion request
-func (r *CompletionRequest) GetModelName() string {
-	return r.Model
-}
-
-// IsStream returns whether the request is for streaming response
-func (r *ChatCompletionRequest) IsStream() bool {
-	return r.Stream
-}
-
-// IsStream returns whether the request is for streaming response
-func (r *CompletionRequest) IsStream() bool {
-	return r.Stream
 }
 
 // ModelListEntry represents a model in the list response with additional metadata

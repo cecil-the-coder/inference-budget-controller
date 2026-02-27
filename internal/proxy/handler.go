@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,156 +47,224 @@ const (
 	ContentTypeSSE = "text/event-stream"
 )
 
-// chatCompletionsHandler handles OpenAI-compatible chat completion requests
-func (s *Server) chatCompletionsHandler(c *gin.Context) {
-	startTime := time.Now()
+// openaiPassthroughHandler returns a gin handler that extracts the model name,
+// performs budget/scale-up checks, and forwards the raw request body to the
+// given backend path.
+func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		startTime := time.Now()
 
-	// Read the raw body first so we can forward it later
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Failed to read request body: " + err.Error(),
-				Type:    "invalid_request_error",
-				Code:    "invalid_request",
-			},
-		})
-		return
-	}
-	// Restore the body for ShouldBindJSON
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	var req ChatCompletionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Invalid request: " + err.Error(),
-				Type:    "invalid_request_error",
-				Code:    "invalid_request",
-			},
-		})
-		return
-	}
-
-	ctx := c.Request.Context()
-	logger := log.FromContext(ctx).WithValues("model", req.Model)
-
-	// 1. Look up the InferenceModel CRD by model name
-	model, err := s.lookupInferenceModelByName(ctx, req.Model)
-	if err != nil {
-		logger.Error(err, "Failed to lookup InferenceModel")
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Failed to lookup model: " + err.Error(),
-				Type:    "server_error",
-				Code:    "internal_error",
-			},
-		})
-		return
-	}
-
-	if model == nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{
-			Error: ErrorDetail{
-				Message: fmt.Sprintf("Model '%s' not found", req.Model),
-				Type:    "invalid_request_error",
-				Code:    "model_not_found",
-			},
-		})
-		return
-	}
-
-	logger = logger.WithValues("inferenceModel", model.Name, "namespace", model.Namespace)
-
-	// Log with structured fields including memory info
-	logger.Info("Processing chat completion request",
-		"model", req.Model,
-		"memory_declared", model.Spec.Resources.Memory,
-		"memory_observed", model.Status.ObservedPeakMemory,
-		"utilization_percent", model.Status.UtilizationPercent,
-	)
-
-	// 2. Check if model is ready
-	if !model.Status.Ready {
-		// Model is not ready, check if we can scale it up
-		if !s.canScaleUp(ctx, model) {
-			// Cannot allocate memory, return 429
-			s.handleInsufficientMemory(c, model)
+		// Read the raw body first so we can forward it later
+		bodyBytes, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Error: ErrorDetail{
+					Message: "Failed to read request body: " + err.Error(),
+					Type:    "invalid_request_error",
+					Code:    "invalid_request",
+				},
+			})
+			return
+		}
+		var req inferenceRequest
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Error: ErrorDetail{
+					Message: "Invalid request: " + err.Error(),
+					Type:    "invalid_request_error",
+					Code:    "invalid_request",
+				},
+			})
 			return
 		}
 
-		// Trigger scale-up and wait for readiness
-		if err := s.triggerScaleUp(ctx, model); err != nil {
-			logger.Error(err, "Failed to trigger scale-up")
+		ctx := c.Request.Context()
+		logger := log.FromContext(ctx).WithValues("model", req.Model)
+
+		// 1. Look up the InferenceModel CRD by model name
+		model, err := s.lookupInferenceModelByName(ctx, req.Model)
+		if err != nil {
+			logger.Error(err, "Failed to lookup InferenceModel")
 			c.JSON(http.StatusInternalServerError, ErrorResponse{
 				Error: ErrorDetail{
-					Message: "Failed to scale up model: " + err.Error(),
+					Message: "Failed to lookup model: " + err.Error(),
 					Type:    "server_error",
-					Code:    "scale_up_failed",
+					Code:    "internal_error",
 				},
 			})
 			return
 		}
 
-		// Wait for model to become ready
-		if err := s.waitForModelReady(ctx, model); err != nil {
-			logger.Error(err, "Model failed to become ready")
-			c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+		if model == nil {
+			c.JSON(http.StatusNotFound, ErrorResponse{
 				Error: ErrorDetail{
-					Message: "Model failed to become ready: " + err.Error(),
-					Type:    "server_error",
-					Code:    "model_not_ready",
+					Message: fmt.Sprintf("Model '%s' not found", req.Model),
+					Type:    "invalid_request_error",
+					Code:    "model_not_found",
 				},
 			})
 			return
 		}
-	}
 
-	// 3. Forward request to backend
-	s.forwardRequest(c, model, bodyBytes, &req, startTime)
+		logger = logger.WithValues("inferenceModel", model.Name, "namespace", model.Namespace)
+
+		// Log with structured fields including memory info
+		logger.Info("Processing inference request",
+			"model", req.Model,
+			"memory_declared", model.Spec.Resources.Memory,
+			"memory_observed", model.Status.ObservedPeakMemory,
+			"utilization_percent", model.Status.UtilizationPercent,
+		)
+
+		// 2. Check if model is ready
+		if !model.Status.Ready {
+			// Model is not ready, check if we can scale it up
+			if !s.canScaleUp(ctx, model) {
+				// Cannot allocate memory, return 429
+				s.handleInsufficientMemory(c, model)
+				return
+			}
+
+			// Trigger scale-up and wait for readiness
+			if err := s.triggerScaleUp(ctx, model); err != nil {
+				logger.Error(err, "Failed to trigger scale-up")
+				c.JSON(http.StatusInternalServerError, ErrorResponse{
+					Error: ErrorDetail{
+						Message: "Failed to scale up model: " + err.Error(),
+						Type:    "server_error",
+						Code:    "scale_up_failed",
+					},
+				})
+				return
+			}
+
+			// Wait for model to become ready
+			if err := s.waitForModelReady(ctx, model); err != nil {
+				logger.Error(err, "Model failed to become ready")
+				c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+					Error: ErrorDetail{
+						Message: "Model failed to become ready: " + err.Error(),
+						Type:    "server_error",
+						Code:    "model_not_ready",
+					},
+				})
+				return
+			}
+		}
+
+		// 3. Forward request to backend
+		s.forwardToBackend(c, model, bodyBytes, &req, backendPath, startTime)
+	}
 }
 
-// completionsHandler handles OpenAI-compatible completion requests
-func (s *Server) completionsHandler(c *gin.Context) {
-	startTime := time.Now()
+// multipartPassthroughHandler returns a gin handler for multipart/form-data
+// endpoints (e.g. audio transcriptions) where the model field is in form data
+// rather than a JSON body.
+func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		startTime := time.Now()
 
-	// Read the raw body first so we can forward it later
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Failed to read request body: " + err.Error(),
-				Type:    "invalid_request_error",
-				Code:    "invalid_request",
-			},
-		})
-		return
+		modelName := c.Request.FormValue("model")
+		if modelName == "" {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Error: ErrorDetail{
+					Message: "Missing required field: model",
+					Type:    "invalid_request_error",
+					Code:    "invalid_request",
+				},
+			})
+			return
+		}
+
+		ctx := c.Request.Context()
+		logger := log.FromContext(ctx).WithValues("model", modelName)
+
+		// 1. Look up the InferenceModel CRD by model name
+		model, err := s.lookupInferenceModelByName(ctx, modelName)
+		if err != nil {
+			logger.Error(err, "Failed to lookup InferenceModel")
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Error: ErrorDetail{
+					Message: "Failed to lookup model: " + err.Error(),
+					Type:    "server_error",
+					Code:    "internal_error",
+				},
+			})
+			return
+		}
+
+		if model == nil {
+			c.JSON(http.StatusNotFound, ErrorResponse{
+				Error: ErrorDetail{
+					Message: fmt.Sprintf("Model '%s' not found", modelName),
+					Type:    "invalid_request_error",
+					Code:    "model_not_found",
+				},
+			})
+			return
+		}
+
+		logger = logger.WithValues("inferenceModel", model.Name, "namespace", model.Namespace)
+
+		logger.Info("Processing inference request",
+			"model", modelName,
+			"memory_declared", model.Spec.Resources.Memory,
+			"memory_observed", model.Status.ObservedPeakMemory,
+			"utilization_percent", model.Status.UtilizationPercent,
+		)
+
+		// 2. Check if model is ready
+		if !model.Status.Ready {
+			if !s.canScaleUp(ctx, model) {
+				s.handleInsufficientMemory(c, model)
+				return
+			}
+
+			if err := s.triggerScaleUp(ctx, model); err != nil {
+				logger.Error(err, "Failed to trigger scale-up")
+				c.JSON(http.StatusInternalServerError, ErrorResponse{
+					Error: ErrorDetail{
+						Message: "Failed to scale up model: " + err.Error(),
+						Type:    "server_error",
+						Code:    "scale_up_failed",
+					},
+				})
+				return
+			}
+
+			if err := s.waitForModelReady(ctx, model); err != nil {
+				logger.Error(err, "Model failed to become ready")
+				c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+					Error: ErrorDetail{
+						Message: "Model failed to become ready: " + err.Error(),
+						Type:    "server_error",
+						Code:    "model_not_ready",
+					},
+				})
+				return
+			}
+		}
+
+		// 3. Forward the original request to backend (preserving multipart body)
+		s.forwardRawRequest(c, model, backendPath, startTime)
 	}
-	// Restore the body for ShouldBindJSON
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+}
 
-	var req CompletionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Invalid request: " + err.Error(),
-				Type:    "invalid_request_error",
-				Code:    "invalid_request",
-			},
-		})
-		return
-	}
-
+// forwardRawRequest forwards the original HTTP request to the backend,
+// preserving the original body, content-type, and headers. Used for
+// multipart/form-data requests where we cannot re-read the body from bytes.
+func (s *Server) forwardRawRequest(c *gin.Context, model *inferencev1alpha1.InferenceModel, backendPath string, startTime time.Time) {
 	ctx := c.Request.Context()
-	logger := log.FromContext(ctx).WithValues("model", req.Model)
+	logger := log.FromContext(ctx)
 
-	// 1. Look up the InferenceModel CRD by model name
-	model, err := s.lookupInferenceModelByName(ctx, req.Model)
+	backendURL := s.getBackendURL(model)
+
+	backendReq, err := http.NewRequestWithContext(ctx, c.Request.Method, backendURL+backendPath, c.Request.Body)
 	if err != nil {
-		logger.Error(err, "Failed to lookup InferenceModel")
+		s.recordRequestMetrics(model, startTime, metrics.StatusError)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error: ErrorDetail{
-				Message: "Failed to lookup model: " + err.Error(),
+				Message: "Failed to create backend request: " + err.Error(),
 				Type:    "server_error",
 				Code:    "internal_error",
 			},
@@ -203,65 +272,48 @@ func (s *Server) completionsHandler(c *gin.Context) {
 		return
 	}
 
-	if model == nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{
+	for key, values := range c.Request.Header {
+		for _, value := range values {
+			backendReq.Header.Add(key, value)
+		}
+	}
+	backendReq.ContentLength = c.Request.ContentLength
+
+	httpClient := &http.Client{
+		Timeout: 10 * time.Minute,
+	}
+
+	resp, err := httpClient.Do(backendReq)
+	if err != nil {
+		logger.Error(err, "Failed to forward request to backend",
+			"model", model.Name,
+			"namespace", model.Namespace,
+			"backend_url", backendURL,
+		)
+		s.recordRequestMetrics(model, startTime, metrics.StatusError)
+		c.JSON(http.StatusBadGateway, ErrorResponse{
 			Error: ErrorDetail{
-				Message: fmt.Sprintf("Model '%s' not found", req.Model),
-				Type:    "invalid_request_error",
-				Code:    "model_not_found",
+				Message: "Failed to connect to backend: " + err.Error(),
+				Type:    "server_error",
+				Code:    "backend_unavailable",
 			},
 		})
 		return
 	}
+	defer func() { _ = resp.Body.Close() }()
 
-	logger = logger.WithValues("inferenceModel", model.Name, "namespace", model.Namespace)
+	s.IdleTracker.RecordRequest(model.Namespace, model.Name)
+	s.recordRequestMetrics(model, startTime, metrics.StatusSuccess)
 
-	// Log with structured fields including memory info
-	logger.Info("Processing completion request",
-		"model", req.Model,
-		"memory_declared", model.Spec.Resources.Memory,
-		"memory_observed", model.Status.ObservedPeakMemory,
-		"utilization_percent", model.Status.UtilizationPercent,
+	duration := time.Since(startTime)
+	logger.Info("Request completed",
+		"model", model.Name,
+		"namespace", model.Namespace,
+		"status_code", resp.StatusCode,
+		"duration_ms", duration.Milliseconds(),
 	)
 
-	// 2. Check if model is ready
-	if !model.Status.Ready {
-		// Model is not ready, check if we can scale it up
-		if !s.canScaleUp(ctx, model) {
-			// Cannot allocate memory, return 429
-			s.handleInsufficientMemory(c, model)
-			return
-		}
-
-		// Trigger scale-up and wait for readiness
-		if err := s.triggerScaleUp(ctx, model); err != nil {
-			logger.Error(err, "Failed to trigger scale-up")
-			c.JSON(http.StatusInternalServerError, ErrorResponse{
-				Error: ErrorDetail{
-					Message: "Failed to scale up model: " + err.Error(),
-					Type:    "server_error",
-					Code:    "scale_up_failed",
-				},
-			})
-			return
-		}
-
-		// Wait for model to become ready
-		if err := s.waitForModelReady(ctx, model); err != nil {
-			logger.Error(err, "Model failed to become ready")
-			c.JSON(http.StatusServiceUnavailable, ErrorResponse{
-				Error: ErrorDetail{
-					Message: "Model failed to become ready: " + err.Error(),
-					Type:    "server_error",
-					Code:    "model_not_ready",
-				},
-			})
-			return
-		}
-	}
-
-	// 3. Forward request to backend
-	s.forwardCompletionRequest(c, model, bodyBytes, &req, startTime)
+	s.handleNonStreamingResponse(c, resp)
 }
 
 // listModelsHandler returns list of available models
@@ -458,8 +510,8 @@ func (s *Server) getBackendURL(model *inferencev1alpha1.InferenceModel) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d", model.Name, model.Namespace, port)
 }
 
-// forwardRequest forwards a chat completion request to the backend
-func (s *Server) forwardRequest(c *gin.Context, model *inferencev1alpha1.InferenceModel, bodyBytes []byte, req *ChatCompletionRequest, startTime time.Time) {
+// forwardToBackend forwards a request to the given backend path
+func (s *Server) forwardToBackend(c *gin.Context, model *inferencev1alpha1.InferenceModel, bodyBytes []byte, req *inferenceRequest, backendPath string, startTime time.Time) {
 	ctx := c.Request.Context()
 	logger := log.FromContext(ctx)
 
@@ -467,7 +519,7 @@ func (s *Server) forwardRequest(c *gin.Context, model *inferencev1alpha1.Inferen
 	backendURL := s.getBackendURL(model)
 
 	// Create request to backend
-	backendReq, err := http.NewRequestWithContext(ctx, "POST", backendURL+"/v1/chat/completions", bytes.NewReader(bodyBytes))
+	backendReq, err := http.NewRequestWithContext(ctx, "POST", backendURL+backendPath, bytes.NewReader(bodyBytes))
 	if err != nil {
 		s.recordRequestMetrics(model, startTime, metrics.StatusError)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
@@ -545,86 +597,6 @@ func (s *Server) recordRequestMetrics(model *inferencev1alpha1.InferenceModel, s
 	}
 	duration := time.Since(startTime)
 	s.Metrics.RecordRequest(model.Name, model.Namespace, status, duration)
-}
-
-// forwardCompletionRequest forwards a completion request to the backend
-func (s *Server) forwardCompletionRequest(c *gin.Context, model *inferencev1alpha1.InferenceModel, bodyBytes []byte, req *CompletionRequest, startTime time.Time) {
-	ctx := c.Request.Context()
-	logger := log.FromContext(ctx)
-
-	// Construct backend URL from model's service
-	backendURL := s.getBackendURL(model)
-
-	// Create request to backend
-	backendReq, err := http.NewRequestWithContext(ctx, "POST", backendURL+"/v1/completions", bytes.NewReader(bodyBytes))
-	if err != nil {
-		s.recordRequestMetrics(model, startTime, metrics.StatusError)
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Failed to create backend request: " + err.Error(),
-				Type:    "server_error",
-				Code:    "internal_error",
-			},
-		})
-		return
-	}
-
-	// Copy headers
-	for key, values := range c.Request.Header {
-		for _, value := range values {
-			backendReq.Header.Add(key, value)
-		}
-	}
-
-	// Send request to backend
-	httpClient := &http.Client{
-		Timeout: 10 * time.Minute,
-	}
-
-	resp, err := httpClient.Do(backendReq)
-	if err != nil {
-		logger.Error(err, "Failed to forward request to backend",
-			"model", model.Name,
-			"namespace", model.Namespace,
-			"backend_url", backendURL,
-		)
-		s.recordRequestMetrics(model, startTime, metrics.StatusError)
-		c.JSON(http.StatusBadGateway, ErrorResponse{
-			Error: ErrorDetail{
-				Message: "Failed to connect to backend: " + err.Error(),
-				Type:    "server_error",
-				Code:    "backend_unavailable",
-			},
-		})
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// Update idle tracker
-	s.IdleTracker.RecordRequest(model.Namespace, model.Name)
-
-	// Record successful request metrics
-	s.recordRequestMetrics(model, startTime, metrics.StatusSuccess)
-
-	// Log request completion
-	duration := time.Since(startTime)
-	logger.Info("Request completed",
-		"model", model.Name,
-		"namespace", model.Namespace,
-		"status_code", resp.StatusCode,
-		"duration_ms", duration.Milliseconds(),
-		"memory_declared", model.Spec.Resources.Memory,
-		"memory_observed", model.Status.ObservedPeakMemory,
-	)
-
-	// Handle streaming response
-	if req.Stream {
-		s.handleStreamingResponse(c, resp)
-		return
-	}
-
-	// Handle non-streaming response
-	s.handleNonStreamingResponse(c, resp)
 }
 
 // handleStreamingResponse handles a streaming response from the backend

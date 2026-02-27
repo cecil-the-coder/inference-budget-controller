@@ -167,8 +167,10 @@ func (s *Server) setupRoutes() {
 	// OpenAI-compatible API
 	v1 := s.router.Group("/v1")
 	{
-		v1.POST("/chat/completions", s.chatCompletionsHandler)
-		v1.POST("/completions", s.completionsHandler)
+		v1.POST("/chat/completions", s.openaiPassthroughHandler("/v1/chat/completions"))
+		v1.POST("/completions", s.openaiPassthroughHandler("/v1/completions"))
+		v1.POST("/embeddings", s.openaiPassthroughHandler("/v1/embeddings"))
+		v1.POST("/audio/transcriptions", s.multipartPassthroughHandler("/v1/audio/transcriptions"))
 		v1.GET("/models", s.listModelsHandler)
 	}
 }

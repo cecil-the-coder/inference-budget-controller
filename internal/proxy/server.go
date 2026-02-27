@@ -225,15 +225,6 @@ func (s *Server) lookupInferenceModelByName(ctx context.Context, modelName strin
 	return nil, nil
 }
 
-// lookupInferenceModelByNameNamespace finds an InferenceModel by name in a specific namespace
-func (s *Server) lookupInferenceModelByNameNamespace(ctx context.Context, name, namespace string) (*inferencev1alpha1.InferenceModel, error) {
-	var model inferencev1alpha1.InferenceModel
-	key := client.ObjectKey{Name: name, Namespace: namespace}
-	if err := s.K8sClient.Get(ctx, key, &model); err != nil {
-		return nil, err
-	}
-	return &model, nil
-}
 
 // listAllInferenceModels returns all InferenceModels in the configured namespace
 func (s *Server) listAllInferenceModels(ctx context.Context) (*inferencev1alpha1.InferenceModelList, error) {

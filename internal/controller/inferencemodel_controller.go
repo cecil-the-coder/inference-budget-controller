@@ -241,7 +241,7 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 	}
 
 	// Create the deployment
-	if err := r.Client.Create(ctx, deployment); err != nil {
+	if err := r.Create(ctx, deployment); err != nil {
 		if errors.IsAlreadyExists(err) {
 			// Deployment already exists, requeue to handle it in next iteration
 			logger.Info("Deployment already exists, requeuing")
@@ -258,7 +258,7 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 		// This shouldn't happen since we checked with CanAllocate, but handle it
 		logger.Error(nil, "failed to allocate memory after creating deployment")
 		// Clean up the deployment we just created
-		_ = r.Client.Delete(ctx, deployment)
+		_ = r.Delete(ctx, deployment)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -544,7 +544,7 @@ func (r *InferenceModelReconciler) scaleToZero(ctx context.Context, model *infer
 
 	logger.Info("Scaled deployment to zero replicas", "model", model.Name)
 	r.Recorder.Event(model, corev1.EventTypeNormal, "ScaledToZero",
-		fmt.Sprintf("Scaled deployment to 0 replicas due to inactivity"))
+		"Scaled deployment to 0 replicas due to inactivity")
 
 	// Update status
 	if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,

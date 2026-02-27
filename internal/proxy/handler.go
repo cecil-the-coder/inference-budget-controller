@@ -498,7 +498,7 @@ func (s *Server) forwardRequest(c *gin.Context, model *inferencev1alpha1.Inferen
 		})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Update idle tracker
 	s.IdleTracker.RecordRequest(model.Namespace, model.Name)
@@ -584,7 +584,7 @@ func (s *Server) forwardCompletionRequest(c *gin.Context, model *inferencev1alph
 		})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Update idle tracker
 	s.IdleTracker.RecordRequest(model.Namespace, model.Name)
@@ -644,7 +644,9 @@ func (s *Server) handleStreamingResponse(c *gin.Context, resp *http.Response) {
 			break
 		}
 
-		c.Writer.WriteString(line)
+		if _, err := c.Writer.WriteString(line); err != nil {
+			s.Logger.Error(err, "Failed to write streaming response")
+		}
 		flusher.Flush()
 	}
 }
@@ -674,26 +676,11 @@ func (s *Server) handleNonStreamingResponse(c *gin.Context, resp *http.Response)
 		return
 	}
 
-	c.Writer.Write(body)
+	if _, err := c.Writer.Write(body); err != nil {
+		s.Logger.Error(err, "Failed to write response body")
+	}
 }
 
-// unmarshalChatRequest unmarshals a chat completion request from raw bytes
-func unmarshalChatRequest(body []byte) (*ChatCompletionRequest, error) {
-	var req ChatCompletionRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, err
-	}
-	return &req, nil
-}
-
-// unmarshalCompletionRequest unmarshals a completion request from raw bytes
-func unmarshalCompletionRequest(body []byte) (*CompletionRequest, error) {
-	var req CompletionRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, err
-	}
-	return &req, nil
-}
 
 // getNodeSelectorKey generates a key from node selector for logging
 func getNodeSelectorKey(nodeSelector map[string]string) string {

@@ -4,5 +4,4 @@ kind: Kustomization
 resources:
   - ../crd
   - ../rbac
-  - ../backends
   - ../manager

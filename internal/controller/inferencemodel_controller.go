@@ -585,6 +585,9 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 		}
 	}
 
+	// Create symlink to the first .gguf file (for backends that expect a predictable path)
+	fmt.Fprintf(&cmd, " && GGUF_FILE=$(ls %s/*.gguf 2>/dev/null | head -1) && [ -n \"$GGUF_FILE\" ] && ln -sf \"$GGUF_FILE\" %s/model.gguf || true", modelDir, modelDir)
+
 	// Create .ready file when complete
 	fmt.Fprintf(&cmd, " && touch %s/.ready", modelDir)
 

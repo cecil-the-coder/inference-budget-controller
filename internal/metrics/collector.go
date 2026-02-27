@@ -371,7 +371,7 @@ func (c *Collector) UpdateModelMetrics(model *inferencev1alpha1.InferenceModel) 
 	}
 
 	// Parse declared memory
-	declaredBytes := parseMemoryToBytes(model.Spec.Memory)
+	declaredBytes := parseMemoryToBytes(model.Spec.Resources.Memory)
 	c.memoryDeclared.With(labels).Set(float64(declaredBytes))
 
 	// Update ready status

@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - llamacpp-vulkan.yaml
+  - llamacpp-vulkan-moe.yaml
+  - llamacpp-rocm.yaml
+  - llamacpp-cpu.yaml
+  - vllm.yaml

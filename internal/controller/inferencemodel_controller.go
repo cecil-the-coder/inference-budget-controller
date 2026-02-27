@@ -86,6 +86,7 @@ type InferenceModelReconciler struct {
 //+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencemodels,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencemodels/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencemodels/finalizers,verbs=update
+//+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencebackends,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -166,7 +167,7 @@ func (r *InferenceModelReconciler) handleDeletion(ctx context.Context, model *in
 	logger.Info("Handling InferenceModel deletion, releasing memory budget",
 		"model", model.Name,
 		"namespace", model.Namespace,
-		"memory_declared", model.Spec.Memory,
+		"memory_declared", model.Spec.Resources.Memory,
 		"utilization_percent", model.Status.UtilizationPercent,
 	)
 
@@ -210,12 +211,26 @@ func (r *InferenceModelReconciler) removeFinalizer(ctx context.Context, model *i
 func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *inferencev1alpha1.InferenceModel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Fetch the InferenceBackend
+	backend := &inferencev1alpha1.InferenceBackend{}
+	backendKey := client.ObjectKey{Name: model.Spec.Backend, Namespace: model.Namespace}
+	if err := r.Get(ctx, backendKey, backend); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Error(err, "InferenceBackend not found", "backend", model.Spec.Backend)
+			r.Recorder.Event(model, corev1.EventTypeWarning, "BackendNotFound",
+				fmt.Sprintf("InferenceBackend %s not found", model.Spec.Backend))
+			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+		}
+		logger.Error(err, "failed to fetch InferenceBackend")
+		return ctrl.Result{}, fmt.Errorf("failed to fetch InferenceBackend: %w", err)
+	}
+
 	// Check if we have enough memory budget
-	if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector) {
+	if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
 		logger.Info("Insufficient memory budget, cannot create deployment",
 			"model", model.Name,
 			"namespace", model.Namespace,
-			"memory_declared", model.Spec.Memory,
+			"memory_declared", model.Spec.Resources.Memory,
 			"node", getNodeSelectorKey(model.Spec.NodeSelector))
 
 		r.Recorder.Event(model, corev1.EventTypeWarning, "InsufficientMemory",
@@ -232,7 +247,11 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 	}
 
 	// Build the deployment spec
-	deployment := r.buildDeployment(model)
+	deployment, err := r.buildDeployment(model, backend)
+	if err != nil {
+		logger.Error(err, "failed to build deployment")
+		return ctrl.Result{}, fmt.Errorf("failed to build deployment: %w", err)
+	}
 
 	// Set owner reference
 	if err := controllerutil.SetControllerReference(model, deployment, r.Scheme); err != nil {
@@ -254,7 +273,7 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 	}
 
 	// Allocate memory budget
-	if !r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector) {
+	if !r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
 		// This shouldn't happen since we checked with CanAllocate, but handle it
 		logger.Error(nil, "failed to allocate memory after creating deployment")
 		// Clean up the deployment we just created
@@ -265,9 +284,10 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 	logger.Info("Created deployment for InferenceModel",
 		"model", model.Name,
 		"namespace", model.Namespace,
-		"memory_declared", model.Spec.Memory,
+		"memory_declared", model.Spec.Resources.Memory,
 		"node", getNodeSelectorKey(model.Spec.NodeSelector),
-		"container_image", model.Spec.ContainerImage)
+		"backend", model.Spec.Backend,
+		"container_image", deployment.Spec.Template.Spec.Containers[0].Image)
 
 	r.Recorder.Event(model, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created deployment %s", deployment.Name))
@@ -281,47 +301,86 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 }
 
-// buildDeployment creates a Deployment spec from an InferenceModel
-func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.InferenceModel) *appsv1.Deployment {
+// buildDeployment creates a Deployment spec from an InferenceModel and InferenceBackend
+func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (*appsv1.Deployment, error) {
 	labels := map[string]string{
 		"app.kubernetes.io/name":      model.Name,
 		"app.kubernetes.io/component": "inference-server",
 		"inference.eh-ops.io/model":   model.Spec.ModelName,
+		"inference.eh-ops.io/backend": model.Spec.Backend,
 		"inference.eh-ops.io/managed": "true",
 	}
+
+	// Determine the port to use (allow override from model)
+	port := backend.Spec.Port
+	if port == 0 {
+		port = DefaultContainerPort
+	}
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Port != nil {
+		port = *model.Spec.BackendOverrides.Port
+	}
+
+	// Determine the image to use (allow override from model)
+	imageRef := &backend.Spec.Image
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Image != nil {
+		imageRef = model.Spec.BackendOverrides.Image
+	}
+	image := imageRef.GetImage()
+
+	// Determine probe paths (allow override from model)
+	readinessPath := backend.Spec.ReadinessPath
+	if readinessPath == "" {
+		readinessPath = "/health"
+	}
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.ReadinessPath != nil {
+		readinessPath = *model.Spec.BackendOverrides.ReadinessPath
+	}
+
+	livenessPath := backend.Spec.LivenessPath
+	if livenessPath == "" {
+		livenessPath = readinessPath
+	}
+
+	// Build environment variables - start with backend env, then add model-specific
+	envVars := []corev1.EnvVar{
+		{
+			Name:  "MODEL_NAME",
+			Value: model.Spec.ModelName,
+		},
+		{
+			Name:  "BACKEND_URL",
+			Value: fmt.Sprintf("http://localhost:%d", port),
+		},
+		{
+			Name:  "PORT",
+			Value: fmt.Sprintf("%d", port),
+		},
+	}
+	// Add backend env vars
+	envVars = append(envVars, backend.Spec.Env...)
+	// Add model env vars (can override backend)
+	envVars = append(envVars, model.Spec.Env...)
 
 	// Build container
 	container := corev1.Container{
 		Name:            "inference",
-		Image:           model.Spec.ContainerImage,
+		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          "http",
-				ContainerPort: DefaultContainerPort,
+				ContainerPort: port,
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		Env: []corev1.EnvVar{
-			{
-				Name:  "MODEL_NAME",
-				Value: model.Spec.ModelName,
-			},
-			{
-				Name:  "BACKEND_URL",
-				Value: model.Spec.BackendURL,
-			},
-			{
-				Name:  "PORT",
-				Value: fmt.Sprintf("%d", DefaultContainerPort),
-			},
-		},
-		Resources: r.buildResourceRequirements(model),
+		Env:         envVars,
+		VolumeMounts: backend.Spec.VolumeMounts,
+		Resources:   r.buildResourceRequirements(model, backend),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
-					Path: "/health",
-					Port: intstr.FromInt(DefaultContainerPort),
+					Path: readinessPath,
+					Port: intstr.FromInt(int(port)),
 				},
 			},
 			InitialDelaySeconds: 30,
@@ -333,8 +392,8 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
-					Path: "/health",
-					Port: intstr.FromInt(DefaultContainerPort),
+					Path: livenessPath,
+					Port: intstr.FromInt(int(port)),
 				},
 			},
 			InitialDelaySeconds: 60,
@@ -344,28 +403,78 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 		},
 	}
 
-	// Add environment variables from spec if any
-	container.Env = append(container.Env, r.buildEnvVars(model)...)
+	// Set command if specified
+	if len(backend.Spec.Command) > 0 {
+		container.Command = backend.Spec.Command
+	}
+
+	// Set args - start with backend args, then append model args
+	container.Args = append(backend.Spec.Args, model.Spec.Args...)
+
+	// Set security context if specified
+	if backend.Spec.SecurityContext != nil {
+		container.SecurityContext = backend.Spec.SecurityContext
+	}
 
 	// Build pod spec
 	podSpec := corev1.PodSpec{
 		Containers:   []corev1.Container{container},
 		NodeSelector: model.Spec.NodeSelector,
+		Volumes:      backend.Spec.Volumes,
 	}
 
-	// Add tolerations for GPU nodes if needed
-	if model.Spec.Resources.Limits.GPU != "" || model.Spec.Resources.Requests.GPU != "" {
-		podSpec.Tolerations = []corev1.Toleration{
-			{
-				Key:      "nvidia.com/gpu",
-				Operator: corev1.TolerationOpExists,
-				Effect:   corev1.TaintEffectNoSchedule,
-			},
+	// Add tolerations from model
+	if len(model.Spec.Tolerations) > 0 {
+		podSpec.Tolerations = model.Spec.Tolerations
+	}
+
+	// Add affinity from model
+	if model.Spec.Affinity != nil {
+		podSpec.Affinity = model.Spec.Affinity
+	}
+
+	// Add init containers from backend
+	if len(backend.Spec.InitContainers) > 0 {
+		podSpec.InitContainers = backend.Spec.InitContainers
+	}
+
+	// Add sidecar from model if specified
+	if model.Spec.Sidecar != nil {
+		sidecar := corev1.Container{
+			Name:  model.Spec.Sidecar.Name,
+			Image: model.Spec.Sidecar.Image,
+			Ports: model.Spec.Sidecar.Ports,
+			Args:  model.Spec.Sidecar.Args,
+			Env:   model.Spec.Sidecar.Env,
+		}
+		if model.Spec.Sidecar.Resources != nil {
+			sidecar.Resources = *model.Spec.Sidecar.Resources
+		}
+		if sidecar.Name == "" {
+			sidecar.Name = "sidecar"
+		}
+		podSpec.Containers = append(podSpec.Containers, sidecar)
+	}
+
+	// Add tolerations for GPU nodes if GPU is configured
+	gpuConfig := backend.Spec.GPU
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.GPU != nil {
+		gpuConfig = model.Spec.BackendOverrides.GPU
+	}
+	if gpuConfig != nil && (gpuConfig.Exclusive || gpuConfig.Shared) {
+		if len(podSpec.Tolerations) == 0 {
+			podSpec.Tolerations = []corev1.Toleration{
+				{
+					Key:      "nvidia.com/gpu",
+					Operator: corev1.TolerationOpExists,
+					Effect:   corev1.TaintEffectNoSchedule,
+				},
+			}
 		}
 	}
 
 	// Build deployment
-	replicas := model.Spec.MaxReplicas
+	replicas := model.Spec.Scaling.MaxReplicas
 	if replicas == 0 {
 		replicas = 1
 	}
@@ -376,7 +485,8 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 			Namespace: model.Namespace,
 			Labels:    labels,
 			Annotations: map[string]string{
-				"inference.eh-ops.io/memory": model.Spec.Memory,
+				"inference.eh-ops.io/memory":  model.Spec.Resources.Memory,
+				"inference.eh-ops.io/backend": model.Spec.Backend,
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -398,67 +508,63 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 		},
 	}
 
-	return deployment
+	return deployment, nil
 }
 
-// buildResourceRequirements creates ResourceRequirements from the InferenceModel spec
-func (r *InferenceModelReconciler) buildResourceRequirements(model *inferencev1alpha1.InferenceModel) corev1.ResourceRequirements {
+// buildResourceRequirements creates ResourceRequirements from the InferenceModel spec and InferenceBackend
+func (r *InferenceModelReconciler) buildResourceRequirements(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) corev1.ResourceRequirements {
 	requirements := corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{},
 		Limits:   corev1.ResourceList{},
 	}
 
-	// Set requests
-	if model.Spec.Resources.Requests.CPU != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Requests.CPU); err == nil {
-			requirements.Requests[corev1.ResourceCPU] = q
-		}
-	}
-	if model.Spec.Resources.Requests.Memory != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Requests.Memory); err == nil {
+	// Set memory request from spec
+	if model.Spec.Resources.Memory != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.Memory); err == nil {
 			requirements.Requests[corev1.ResourceMemory] = q
-		}
-	} else if model.Spec.Memory != "" {
-		// Use the spec memory as the default memory request
-		if q, err := resource.ParseQuantity(model.Spec.Memory); err == nil {
-			requirements.Requests[corev1.ResourceMemory] = q
-		}
-	}
-	if model.Spec.Resources.Requests.GPU != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Requests.GPU); err == nil {
-			requirements.Requests[corev1.ResourceName("nvidia.com/gpu")] = q
 		}
 	}
 
-	// Set limits
-	if model.Spec.Resources.Limits.CPU != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Limits.CPU); err == nil {
-			requirements.Limits[corev1.ResourceCPU] = q
+	// Set CPU request from spec
+	if model.Spec.Resources.CPU != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.CPU); err == nil {
+			requirements.Requests[corev1.ResourceCPU] = q
 		}
 	}
-	if model.Spec.Resources.Limits.Memory != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Limits.Memory); err == nil {
+
+	// Set memory limit (defaults to memory request if not specified)
+	if model.Spec.Resources.MemoryLimit != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.MemoryLimit); err == nil {
 			requirements.Limits[corev1.ResourceMemory] = q
 		}
-	} else if model.Spec.Memory != "" {
-		// Use the spec memory as the default memory limit
-		if q, err := resource.ParseQuantity(model.Spec.Memory); err == nil {
+	} else if model.Spec.Resources.Memory != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.Memory); err == nil {
 			requirements.Limits[corev1.ResourceMemory] = q
 		}
 	}
-	if model.Spec.Resources.Limits.GPU != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Limits.GPU); err == nil {
-			requirements.Limits[corev1.ResourceName("nvidia.com/gpu")] = q
+
+	// Set GPU resources from backend configuration (can be overridden by model)
+	gpuConfig := backend.Spec.GPU
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.GPU != nil {
+		gpuConfig = model.Spec.BackendOverrides.GPU
+	}
+
+	if gpuConfig != nil {
+		gpuResourceName := corev1.ResourceName("nvidia.com/gpu")
+		if gpuConfig.ResourceName != "" {
+			gpuResourceName = corev1.ResourceName(gpuConfig.ResourceName)
+		} else if gpuConfig.Shared {
+			gpuResourceName = corev1.ResourceName("amd.com/gpu-shared")
+		}
+
+		if gpuConfig.Exclusive || gpuConfig.Shared {
+			// Set GPU to 1 for both exclusive and shared modes
+			requirements.Requests[gpuResourceName] = resource.MustParse("1")
+			requirements.Limits[gpuResourceName] = resource.MustParse("1")
 		}
 	}
 
 	return requirements
-}
-
-// buildEnvVars creates environment variables from the InferenceModel spec
-func (r *InferenceModelReconciler) buildEnvVars(model *inferencev1alpha1.InferenceModel) []corev1.EnvVar {
-	// This can be extended to support custom environment variables from the spec
-	return nil
 }
 
 // handleIdleScaling checks if the model should be scaled to zero due to inactivity
@@ -472,7 +578,17 @@ func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model 
 	}
 
 	// Get cooldown period (default to 10 minutes)
-	cooldownPeriod := model.Spec.CooldownPeriod.Duration
+	var cooldownPeriod time.Duration
+	if model.Spec.Scaling.ScaleToZeroDelay != "" {
+		if d, err := time.ParseDuration(model.Spec.Scaling.ScaleToZeroDelay); err == nil {
+			cooldownPeriod = d
+		}
+	}
+	if cooldownPeriod == 0 && model.Spec.Scaling.CooldownPeriod != "" {
+		if d, err := time.ParseDuration(model.Spec.Scaling.CooldownPeriod); err == nil {
+			cooldownPeriod = d
+		}
+	}
 	if cooldownPeriod == 0 {
 		cooldownPeriod = 10 * time.Minute
 	}
@@ -562,19 +678,20 @@ func (r *InferenceModelReconciler) scaleToZero(ctx context.Context, model *infer
 func (r *InferenceModelReconciler) handleUpdate(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Fetch the InferenceBackend to get current configuration
+	backend := &inferencev1alpha1.InferenceBackend{}
+	backendKey := client.ObjectKey{Name: model.Spec.Backend, Namespace: model.Namespace}
+	if err := r.Get(ctx, backendKey, backend); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Error(err, "InferenceBackend not found", "backend", model.Spec.Backend)
+			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+		}
+		logger.Error(err, "failed to fetch InferenceBackend")
+		return ctrl.Result{}, fmt.Errorf("failed to fetch InferenceBackend: %w", err)
+	}
+
 	needsUpdate := false
 	deploymentCopy := deployment.DeepCopy()
-
-	// Check if container image changed
-	if len(deployment.Spec.Template.Spec.Containers) > 0 {
-		if deployment.Spec.Template.Spec.Containers[0].Image != model.Spec.ContainerImage {
-			logger.Info("Container image changed, updating deployment",
-				"old", deployment.Spec.Template.Spec.Containers[0].Image,
-				"new", model.Spec.ContainerImage)
-			deploymentCopy.Spec.Template.Spec.Containers[0].Image = model.Spec.ContainerImage
-			needsUpdate = true
-		}
-	}
 
 	// Check if node selector changed
 	if !mapsEqual(deployment.Spec.Template.Spec.NodeSelector, model.Spec.NodeSelector) {
@@ -582,7 +699,7 @@ func (r *InferenceModelReconciler) handleUpdate(ctx context.Context, model *infe
 		deploymentCopy.Spec.Template.Spec.NodeSelector = model.Spec.NodeSelector
 
 		// Re-allocate memory budget for new node selector
-		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector) {
+		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
 			logger.Info("Insufficient memory budget for new node selector")
 			r.Recorder.Event(model, corev1.EventTypeWarning, "InsufficientMemory",
 				"Cannot update node selector: insufficient memory budget on target node pool")
@@ -591,16 +708,16 @@ func (r *InferenceModelReconciler) handleUpdate(ctx context.Context, model *infe
 
 		// Release old allocation and create new one
 		r.Tracker.ReleaseModel(model.Name, model.Namespace)
-		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector)
+		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
 		needsUpdate = true
 	}
 
 	// Check if memory annotation changed
-	if deployment.Annotations["inference.eh-ops.io/memory"] != model.Spec.Memory {
+	if deployment.Annotations["inference.eh-ops.io/memory"] != model.Spec.Resources.Memory {
 		if deploymentCopy.Annotations == nil {
 			deploymentCopy.Annotations = make(map[string]string)
 		}
-		deploymentCopy.Annotations["inference.eh-ops.io/memory"] = model.Spec.Memory
+		deploymentCopy.Annotations["inference.eh-ops.io/memory"] = model.Spec.Resources.Memory
 		needsUpdate = true
 	}
 
@@ -611,12 +728,28 @@ func (r *InferenceModelReconciler) handleUpdate(ctx context.Context, model *infe
 	// Check if resources changed
 	if len(deployment.Spec.Template.Spec.Containers) > 0 {
 		currentResources := deployment.Spec.Template.Spec.Containers[0].Resources
-		desiredResources := r.buildResourceRequirements(model)
+		desiredResources := r.buildResourceRequirements(model, backend)
 
 		if !resourceListsEqual(currentResources.Requests, desiredResources.Requests) ||
 			!resourceListsEqual(currentResources.Limits, desiredResources.Limits) {
 			logger.Info("Resources changed, updating deployment")
 			deploymentCopy.Spec.Template.Spec.Containers[0].Resources = desiredResources
+			needsUpdate = true
+		}
+	}
+
+	// Check if container image changed (from backend or override)
+	if len(deployment.Spec.Template.Spec.Containers) > 0 {
+		imageRef := &backend.Spec.Image
+		if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Image != nil {
+			imageRef = model.Spec.BackendOverrides.Image
+		}
+		desiredImage := imageRef.GetImage()
+		if deployment.Spec.Template.Spec.Containers[0].Image != desiredImage {
+			logger.Info("Container image changed, updating deployment",
+				"old", deployment.Spec.Template.Spec.Containers[0].Image,
+				"new", desiredImage)
+			deploymentCopy.Spec.Template.Spec.Containers[0].Image = desiredImage
 			needsUpdate = true
 		}
 	}
@@ -648,13 +781,13 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 	ready := deployment.Status.ReadyReplicas > 0
 	model.Status.Ready = ready
 	model.Status.Replicas = deployment.Status.Replicas
-	model.Status.LastObservation = metav1.Now()
+	model.Status.AvailableReplicas = deployment.Status.AvailableReplicas
 
 	// Set declared memory in status
-	model.Status.DeclaredMemory = model.Spec.Memory
+	model.Status.DeclaredMemory = model.Spec.Resources.Memory
 
 	// Get utilization info from tracker and update status
-	utilizationInfo := r.Tracker.GetUtilization(model.Name, model.Namespace, model.Spec.Memory)
+	utilizationInfo := r.Tracker.GetUtilization(model.Name, model.Namespace, model.Spec.Resources.Memory)
 	if utilizationInfo != nil && utilizationInfo.ObservedPeak != nil {
 		model.Status.ObservedPeakMemory = utilizationInfo.ObservedPeak.String()
 		model.Status.UtilizationPercent = int32(utilizationInfo.Utilization * 100)
@@ -718,7 +851,7 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 	logger.V(1).Info("Updated InferenceModel status",
 		"ready", ready,
 		"replicas", model.Status.Replicas,
-		"memory_declared", model.Spec.Memory,
+		"memory_declared", model.Spec.Resources.Memory,
 		"memory_observed_peak", model.Status.ObservedPeakMemory,
 		"utilization_percent", model.Status.UtilizationPercent,
 		"recommendation", model.Status.Recommendation,
@@ -855,13 +988,13 @@ func (r *InferenceModelReconciler) UpdateLastRequestTime(ctx context.Context, mo
 		}
 
 		// Check if we can allocate memory
-		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector) {
+		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
 			return fmt.Errorf("insufficient memory budget to scale up model %s", modelName)
 		}
 
 		// Allocate memory and scale up
-		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector)
-		replicas := model.Spec.MaxReplicas
+		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
+		replicas := model.Spec.Scaling.MaxReplicas
 		if replicas == 0 {
 			replicas = 1
 		}

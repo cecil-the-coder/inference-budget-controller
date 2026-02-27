@@ -110,7 +110,7 @@ func (s *Server) chatCompletionsHandler(c *gin.Context) {
 	// Log with structured fields including memory info
 	logger.Info("Processing chat completion request",
 		"model", req.Model,
-		"memory_declared", model.Spec.Memory,
+		"memory_declared", model.Spec.Resources.Memory,
 		"memory_observed", model.Status.ObservedPeakMemory,
 		"utilization_percent", model.Status.UtilizationPercent,
 	)
@@ -219,7 +219,7 @@ func (s *Server) completionsHandler(c *gin.Context) {
 	// Log with structured fields including memory info
 	logger.Info("Processing completion request",
 		"model", req.Model,
-		"memory_declared", model.Spec.Memory,
+		"memory_declared", model.Spec.Resources.Memory,
 		"memory_observed", model.Status.ObservedPeakMemory,
 		"utilization_percent", model.Status.UtilizationPercent,
 	)
@@ -298,7 +298,7 @@ func (s *Server) listModelsHandler(c *gin.Context) {
 
 // canScaleUp checks if there is enough memory budget to scale up a model
 func (s *Server) canScaleUp(ctx context.Context, model *inferencev1alpha1.InferenceModel) bool {
-	return s.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector)
+	return s.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
 }
 
 // handleInsufficientMemory handles the case when there's not enough memory
@@ -306,7 +306,7 @@ func (s *Server) handleInsufficientMemory(c *gin.Context, model *inferencev1alph
 	ctx := c.Request.Context()
 	logger := log.FromContext(ctx)
 
-	requestedMemory := resource.MustParse(model.Spec.Memory)
+	requestedMemory := resource.MustParse(model.Spec.Resources.Memory)
 	availableMemory := s.Tracker.GetAvailableMemory(model.Spec.NodeSelector)
 	blockingModels := s.Tracker.GetBlockingModels(model.Spec.NodeSelector, &requestedMemory)
 
@@ -325,7 +325,7 @@ func (s *Server) handleInsufficientMemory(c *gin.Context, model *inferencev1alph
 	logger.Info("Insufficient memory for model",
 		"model", model.Spec.ModelName,
 		"namespace", model.Namespace,
-		"requested", model.Spec.Memory,
+		"requested", model.Spec.Resources.Memory,
 		"available", availableMemory.String(),
 		"blocking", len(blocking),
 		"node", getNodeSelectorKey(model.Spec.NodeSelector),
@@ -345,7 +345,7 @@ func (s *Server) handleInsufficientMemory(c *gin.Context, model *inferencev1alph
 			"details": gin.H{
 				"requested": gin.H{
 					"model":  model.Spec.ModelName,
-					"memory": model.Spec.Memory,
+					"memory": model.Spec.Resources.Memory,
 				},
 				"available": availableMemory.String(),
 				"blocking":  blocking,
@@ -359,7 +359,7 @@ func (s *Server) triggerScaleUp(ctx context.Context, model *inferencev1alpha1.In
 	logger := log.FromContext(ctx)
 
 	// Allocate memory budget first
-	if !s.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Memory, model.Spec.NodeSelector) {
+	if !s.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
 		return fmt.Errorf("failed to allocate memory budget")
 	}
 
@@ -380,7 +380,7 @@ func (s *Server) triggerScaleUp(ctx context.Context, model *inferencev1alpha1.In
 			logger.Info("Deployment not found, controller should create it",
 				"deployment", model.Name,
 				"namespace", model.Namespace,
-				"memory_declared", model.Spec.Memory,
+				"memory_declared", model.Spec.Resources.Memory,
 				"node", getNodeSelectorKey(model.Spec.NodeSelector),
 			)
 			return nil
@@ -398,7 +398,7 @@ func (s *Server) triggerScaleUp(ctx context.Context, model *inferencev1alpha1.In
 		logger.Info("Triggered scale-up for deployment",
 			"deployment", model.Name,
 			"namespace", model.Namespace,
-			"memory_declared", model.Spec.Memory,
+			"memory_declared", model.Spec.Resources.Memory,
 		)
 	}
 
@@ -432,7 +432,7 @@ func (s *Server) waitForModelReady(ctx context.Context, model *inferencev1alpha1
 				logger.Info("Model is now ready",
 					"model", model.Name,
 					"namespace", model.Namespace,
-					"memory_declared", model.Spec.Memory,
+					"memory_declared", model.Spec.Resources.Memory,
 					"memory_observed", currentModel.Status.ObservedPeakMemory,
 					"utilization_percent", currentModel.Status.UtilizationPercent,
 				)
@@ -449,13 +449,25 @@ func (s *Server) waitForModelReady(ctx context.Context, model *inferencev1alpha1
 	}
 }
 
+// getBackendURL constructs the backend URL for a model
+func (s *Server) getBackendURL(model *inferencev1alpha1.InferenceModel) string {
+	port := int32(8080)
+	if model.Spec.Service.Port != nil {
+		port = *model.Spec.Service.Port
+	}
+	return fmt.Sprintf("http://%s.%s.svc:%d", model.Name, model.Namespace, port)
+}
+
 // forwardRequest forwards a chat completion request to the backend
 func (s *Server) forwardRequest(c *gin.Context, model *inferencev1alpha1.InferenceModel, bodyBytes []byte, req *ChatCompletionRequest, startTime time.Time) {
 	ctx := c.Request.Context()
 	logger := log.FromContext(ctx)
 
+	// Construct backend URL from model's service
+	backendURL := s.getBackendURL(model)
+
 	// Create request to backend
-	backendReq, err := http.NewRequestWithContext(ctx, "POST", model.Spec.BackendURL+"/v1/chat/completions", bytes.NewReader(bodyBytes))
+	backendReq, err := http.NewRequestWithContext(ctx, "POST", backendURL+"/v1/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		s.recordRequestMetrics(model, startTime, metrics.StatusError)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
@@ -485,7 +497,7 @@ func (s *Server) forwardRequest(c *gin.Context, model *inferencev1alpha1.Inferen
 		logger.Error(err, "Failed to forward request to backend",
 			"model", model.Name,
 			"namespace", model.Namespace,
-			"backend_url", model.Spec.BackendURL,
+			"backend_url", backendURL,
 		)
 		s.recordRequestMetrics(model, startTime, metrics.StatusError)
 		c.JSON(http.StatusBadGateway, ErrorResponse{
@@ -512,7 +524,7 @@ func (s *Server) forwardRequest(c *gin.Context, model *inferencev1alpha1.Inferen
 		"namespace", model.Namespace,
 		"status_code", resp.StatusCode,
 		"duration_ms", duration.Milliseconds(),
-		"memory_declared", model.Spec.Memory,
+		"memory_declared", model.Spec.Resources.Memory,
 		"memory_observed", model.Status.ObservedPeakMemory,
 	)
 
@@ -540,8 +552,11 @@ func (s *Server) forwardCompletionRequest(c *gin.Context, model *inferencev1alph
 	ctx := c.Request.Context()
 	logger := log.FromContext(ctx)
 
+	// Construct backend URL from model's service
+	backendURL := s.getBackendURL(model)
+
 	// Create request to backend
-	backendReq, err := http.NewRequestWithContext(ctx, "POST", model.Spec.BackendURL+"/v1/completions", bytes.NewReader(bodyBytes))
+	backendReq, err := http.NewRequestWithContext(ctx, "POST", backendURL+"/v1/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		s.recordRequestMetrics(model, startTime, metrics.StatusError)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
@@ -571,7 +586,7 @@ func (s *Server) forwardCompletionRequest(c *gin.Context, model *inferencev1alph
 		logger.Error(err, "Failed to forward request to backend",
 			"model", model.Name,
 			"namespace", model.Namespace,
-			"backend_url", model.Spec.BackendURL,
+			"backend_url", backendURL,
 		)
 		s.recordRequestMetrics(model, startTime, metrics.StatusError)
 		c.JSON(http.StatusBadGateway, ErrorResponse{
@@ -598,7 +613,7 @@ func (s *Server) forwardCompletionRequest(c *gin.Context, model *inferencev1alph
 		"namespace", model.Namespace,
 		"status_code", resp.StatusCode,
 		"duration_ms", duration.Milliseconds(),
-		"memory_declared", model.Spec.Memory,
+		"memory_declared", model.Spec.Resources.Memory,
 		"memory_observed", model.Status.ObservedPeakMemory,
 	)
 

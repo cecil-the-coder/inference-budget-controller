@@ -10,6 +10,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: manager-role
 rules:
+  # Core resources
   - apiGroups:
       - ""
     resources:
@@ -25,6 +26,40 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Apps resources
   - apiGroups:
       - apps
     resources:
@@ -43,6 +78,28 @@ rules:
       - deployments/status
     verbs:
       - get
+
+  # Batch resources (for download jobs)
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - batch
+    resources:
+      - jobs/status
+    verbs:
+      - get
+
+  # Inference API resources
   - apiGroups:
       - inference.eh-ops.io
     resources:
@@ -70,6 +127,22 @@ rules:
       - patch
       - update
   - apiGroups:
+      - inference.eh-ops.io
+    resources:
+      - inferencebackends
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - inference.eh-ops.io
+    resources:
+      - inferencebackends/status
+    verbs:
+      - get
+
+  # Leader election
+  - apiGroups:
       - coordination.k8s.io
     resources:
       - leases
@@ -77,5 +150,19 @@ rules:
       - create
       - get
       - list
+      - update
+      - watch
+
+  # Gateway API (optional, for HTTPRoutes)
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - httproutes
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
       - update
       - watch

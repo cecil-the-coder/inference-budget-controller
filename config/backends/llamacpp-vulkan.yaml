@@ -1,0 +1,43 @@
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceBackend
+metadata:
+  name: llamacpp-vulkan
+  labels:
+    app.kubernetes.io/name: inference-budget-controller
+    app.kubernetes.io/part-of: inference-budget-controller
+spec:
+  image:
+    repository: ghcr.io/ggml-org/llama.cpp
+    tag: server-vulkan
+  port: 8080
+  args:
+    - llama-server
+    - -hf
+    - $(HF_SOURCE)
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8080"
+    - --metrics
+  readinessPath: /health
+  env:
+    - name: LLAMA_HIP_UMA
+      value: "ON"
+  securityContext:
+    capabilities:
+      add:
+        - SYS_PTRACE
+    seccompProfile:
+      type: Unconfined
+  volumes:
+    - name: dri
+      hostPath:
+        path: /dev/dri
+    - name: kfd
+      hostPath:
+        path: /dev/kfd
+  volumeMounts:
+    - name: dri
+      mountPath: /dev/dri
+    - name: kfd
+      mountPath: /dev/kfd

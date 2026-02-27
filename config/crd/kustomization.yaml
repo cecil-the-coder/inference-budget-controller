@@ -3,3 +3,4 @@ kind: Kustomization
 
 resources:
   - bases/inference.eh-ops.io_inferencemodels.yaml
+  - bases/inference.eh-ops.io_inferencebackends.yaml

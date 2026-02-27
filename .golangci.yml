@@ -1,6 +1,8 @@
 # golangci-lint configuration for inference-budget-controller
 # See https://golangci-lint.run/usage/configuration/
 
+version: "2"
+
 run:
   # Timeout for running linters
   timeout: 5m

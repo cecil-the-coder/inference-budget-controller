@@ -16,9 +16,4 @@ linters:
     - errcheck
     - ineffassign
     - gocyclo
-    - dupl
     - misspell
-
-linters-settings:
-  dupl:
-    threshold: 200

@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 
@@ -31,8 +32,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/budget"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/controller"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/proxy"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -52,8 +55,12 @@ func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
+	var proxyAddr string
+	var proxyNamespace string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.StringVar(&proxyAddr, "proxy-bind-address", ":9000", "The address the proxy server binds to.")
+	flag.StringVar(&proxyNamespace, "proxy-namespace", "inference", "The namespace to search for InferenceModels.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -113,6 +120,29 @@ func main() {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
+
+	// Initialize budget tracker
+	budgetTracker := budget.NewTracker()
+
+	// Initialize and start proxy server
+	proxyServer := proxy.NewServer(
+		proxyAddr,
+		budgetTracker,
+		mgr.GetClient(),
+		scheme,
+		proxy.WithNamespace(proxyNamespace),
+		proxy.WithMetrics(metricsCollector),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		setupLog.Info("starting proxy server", "address", proxyAddr)
+		if err := proxyServer.Start(ctx); err != nil {
+			setupLog.Error(err, "proxy server error")
+		}
+	}()
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

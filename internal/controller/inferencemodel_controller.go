@@ -35,7 +35,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/budget"
@@ -51,6 +53,9 @@ const (
 
 	// LastRequestAnnotation is the annotation key for tracking last request time
 	LastRequestAnnotation = "inference.eh-ops.io/last-request-time"
+
+	// RetryDownloadAnnotation is the annotation key for triggering a retry of a failed download
+	RetryDownloadAnnotation = "inference.eh-ops.io/retry-download"
 
 	// DefaultRequeueInterval is the default interval for requeuing reconciliations
 	DefaultRequeueInterval = 30 * time.Second
@@ -125,6 +130,48 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		logger.Info("Added finalizer to InferenceModel")
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Handle retry annotation for failed downloads
+	if _, retryRequested := model.Annotations[RetryDownloadAnnotation]; retryRequested {
+		if model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseFailed {
+			logger.Info("Retry annotation detected for failed download, clearing and retrying", "model", model.Name)
+
+			// Delete the failed download job if it exists
+			jobName := getDownloadJobName(model)
+			job := &batchv1.Job{}
+			err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: model.Namespace}, job)
+			if err == nil {
+				// Job exists, delete it with background propagation so we can recreate it
+				if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+					logger.Error(err, "failed to delete failed download job for retry")
+					return ctrl.Result{}, fmt.Errorf("failed to delete failed download job: %w", err)
+				}
+				logger.Info("Deleted failed download job for retry", "model", model.Name, "job", jobName)
+			} else if !errors.IsNotFound(err) {
+				logger.Error(err, "failed to fetch download job for retry")
+				return ctrl.Result{}, fmt.Errorf("failed to fetch download job: %w", err)
+			}
+
+			// Remove the retry annotation
+			delete(model.Annotations, RetryDownloadAnnotation)
+			if err := r.Update(ctx, model); err != nil {
+				logger.Error(err, "failed to remove retry annotation")
+				return ctrl.Result{}, fmt.Errorf("failed to remove retry annotation: %w", err)
+			}
+
+			// Reset download status to pending to trigger a new download
+			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhasePending, 0, "Retry requested"); err != nil {
+				logger.Error(err, "failed to reset download status for retry")
+				return ctrl.Result{}, fmt.Errorf("failed to reset download status: %w", err)
+			}
+
+			r.Recorder.Event(model, corev1.EventTypeNormal, "DownloadRetry",
+				"Download retry triggered via annotation")
+
+			// Requeue to start the new download
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// Handle HuggingFace download if needed
@@ -202,6 +249,20 @@ func (r *InferenceModelReconciler) handleDeletion(ctx context.Context, model *in
 	// Clean up metrics
 	r.Metrics.DeleteModelMetrics(model.Name, model.Namespace)
 
+	// Clean up model files from shared/existing PVC if needed
+	if r.needsModelCleanup(model) {
+		result, err := r.createCleanupJob(ctx, model)
+		if err != nil {
+			logger.Error(err, "failed to create cleanup job")
+			r.Recorder.Event(model, corev1.EventTypeWarning, "CleanupFailed",
+				fmt.Sprintf("Failed to create cleanup job: %v", err))
+			// Continue with deletion even if cleanup fails
+		} else if result.RequeueAfter > 0 {
+			// Wait for cleanup job to complete
+			return result, nil
+		}
+	}
+
 	// Remove finalizer
 	if err := r.removeFinalizer(ctx, model); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to remove finalizer: %w", err)
@@ -211,6 +272,34 @@ func (r *InferenceModelReconciler) handleDeletion(ctx context.Context, model *in
 	r.Recorder.Event(model, corev1.EventTypeNormal, "Deleted", "Memory budget released and finalizer removed")
 
 	return ctrl.Result{}, nil
+}
+
+// needsModelCleanup returns true if model files should be cleaned up from a shared/existing PVC
+func (r *InferenceModelReconciler) needsModelCleanup(model *inferencev1alpha1.InferenceModel) bool {
+	storage := model.Spec.Storage
+
+	// Only clean up if using HuggingFace source (downloaded models)
+	if model.Spec.Source.HuggingFace == nil {
+		return false
+	}
+
+	// Only clean up if download was complete (files exist on PVC)
+	if model.Status.DownloadPhase != inferencev1alpha1.DownloadPhaseComplete {
+		return false
+	}
+
+	// Clean up if using a shared PVC (Shared is true)
+	if storage.Shared {
+		return true
+	}
+
+	// Clean up if using an existing PVC (Create is false and PVC is specified)
+	if storage.PVC != "" && !storage.Create {
+		return true
+	}
+
+	// Don't clean up auto-created PVCs - they will be deleted by K8s garbage collection
+	return false
 }
 
 // addFinalizer adds the finalizer to the InferenceModel
@@ -254,6 +343,22 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 		}
 		logger.Error(err, "unable to fetch download Job")
 		return ctrl.Result{}, fmt.Errorf("failed to fetch download job: %w", err)
+	}
+
+	// Check if job has failed and we need to clean it up for retry
+	// This handles the case where the job failed but status hasn't been updated yet
+	// or when retrying after a failed download
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			// Job has failed, delete it so we can create a new one
+			logger.Info("Found failed download job, deleting it for retry", "model", model.Name, "job", jobName)
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+				logger.Error(err, "failed to delete failed download job")
+				return ctrl.Result{}, fmt.Errorf("failed to delete failed download job: %w", err)
+			}
+			// Requeue to create a new job
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// Job exists, check its status
@@ -399,20 +504,10 @@ func (r *InferenceModelReconciler) checkDownloadJobStatus(ctx context.Context, m
 	// Check job conditions
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			// Job completed successfully
-			logger.Info("Download job completed successfully", "model", model.Name)
+			// Job completed successfully, but we need to verify the .ready file exists
+			logger.Info("Download job completed, verifying .ready file exists", "model", model.Name)
 
-			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseComplete, 100,
-				"Model download completed"); err != nil {
-				logger.Error(err, "failed to update download status")
-				return ctrl.Result{}, err
-			}
-
-			r.Recorder.Event(model, corev1.EventTypeNormal, "DownloadComplete",
-				"Model download completed successfully")
-
-			// Requeue to proceed with deployment creation
-			return ctrl.Result{Requeue: true}, nil
+			return r.verifyReadyFileAndComplete(ctx, model, job)
 		}
 
 		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
@@ -443,6 +538,293 @@ func (r *InferenceModelReconciler) checkDownloadJobStatus(ctx context.Context, m
 		}
 	}
 
+	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+}
+
+// getVerifyJobName returns the name for the verification job
+func getVerifyJobName(model *inferencev1alpha1.InferenceModel) string {
+	return model.Name + "-verify-ready"
+}
+
+// verifyReadyFileAndComplete verifies the .ready file exists before marking download as complete
+func (r *InferenceModelReconciler) verifyReadyFileAndComplete(ctx context.Context, model *inferencev1alpha1.InferenceModel, downloadJob *batchv1.Job) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// Get the PVC name from the download job
+	pvcName := ""
+	for _, volume := range downloadJob.Spec.Template.Spec.Volumes {
+		if volume.Name == "model-cache" && volume.PersistentVolumeClaim != nil {
+			pvcName = volume.PersistentVolumeClaim.ClaimName
+			break
+		}
+	}
+	if pvcName == "" {
+		logger.Error(nil, "could not find PVC name from download job")
+		return ctrl.Result{}, fmt.Errorf("could not find PVC name from download job")
+	}
+
+	// Check if verification job already exists
+	verifyJobName := getVerifyJobName(model)
+	existingVerifyJob := &batchv1.Job{}
+	err := r.Get(ctx, client.ObjectKey{Name: verifyJobName, Namespace: model.Namespace}, existingVerifyJob)
+	if err == nil {
+		// Verification job exists, check its status
+		return r.checkVerifyJobStatus(ctx, model, existingVerifyJob)
+	}
+	if !errors.IsNotFound(err) {
+		logger.Error(err, "failed to check verification job")
+		return ctrl.Result{}, fmt.Errorf("failed to check verification job: %w", err)
+	}
+
+	// Create verification job
+	modelDir := getModelDir(model)
+	verifyCmd := fmt.Sprintf("if [ -f %s/.ready ]; then echo 'Ready file exists'; exit 0; else echo 'Ready file not found'; exit 1; fi", modelDir)
+
+	verifyJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      verifyJobName,
+			Namespace: model.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      model.Name,
+				"app.kubernetes.io/component": "model-verify",
+				"inference.eh-ops.io/model":   model.Spec.ModelName,
+				"inference.eh-ops.io/managed": "true",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:    "verify",
+							Image:   "busybox:latest",
+							Command: []string{"sh", "-c", verifyCmd},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "model-cache",
+									MountPath: "/models",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "model-cache",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+					},
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+				},
+			},
+		},
+	}
+
+	// Set owner reference
+	if err := controllerutil.SetControllerReference(model, verifyJob, r.Scheme); err != nil {
+		logger.Error(err, "failed to set controller reference on verification job")
+		return ctrl.Result{}, fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	// Create the verification job
+	if err := r.Create(ctx, verifyJob); err != nil {
+		if errors.IsAlreadyExists(err) {
+			logger.Info("Verification job already exists, requeuing")
+			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+		}
+		logger.Error(err, "failed to create verification job")
+		return ctrl.Result{}, fmt.Errorf("failed to create verification job: %w", err)
+	}
+
+	logger.Info("Created verification job to check .ready file", "model", model.Name, "job", verifyJobName)
+
+	// Update status to indicate verification is in progress
+	if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseDownloading, 99,
+		"Verifying download completeness"); err != nil {
+		logger.Error(err, "failed to update download status")
+	}
+
+	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+}
+
+// checkVerifyJobStatus checks the status of a verification job and completes the download if successful
+func (r *InferenceModelReconciler) checkVerifyJobStatus(ctx context.Context, model *inferencev1alpha1.InferenceModel, verifyJob *batchv1.Job) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// Check job conditions
+	for _, condition := range verifyJob.Status.Conditions {
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			// Verification succeeded, .ready file exists
+			logger.Info("Verification job completed, .ready file verified", "model", model.Name)
+
+			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseComplete, 100,
+				"Model download completed and verified"); err != nil {
+				logger.Error(err, "failed to update download status")
+				return ctrl.Result{}, err
+			}
+
+			r.Recorder.Event(model, corev1.EventTypeNormal, "DownloadComplete",
+				"Model download completed successfully, .ready file verified")
+
+			// Clean up the verification job
+			if err := r.Delete(ctx, verifyJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+				logger.Error(err, "failed to delete verification job", "job", verifyJob.Name)
+			}
+
+			// Requeue to proceed with deployment creation
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			// Verification failed, .ready file does not exist
+			logger.Info("Verification job failed, .ready file not found", "model", model.Name, "reason", condition.Reason, "message", condition.Message)
+
+			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseFailed, 0,
+				fmt.Sprintf("Download verification failed: .ready file not found. %s", condition.Message)); err != nil {
+				logger.Error(err, "failed to update download status")
+				return ctrl.Result{}, err
+			}
+
+			r.Recorder.Event(model, corev1.EventTypeWarning, "DownloadFailed",
+				"Model download verification failed: .ready file not found")
+
+			// Clean up the verification job
+			if err := r.Delete(ctx, verifyJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+				logger.Error(err, "failed to delete verification job", "job", verifyJob.Name)
+			}
+
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Verification job is still running
+	logger.V(1).Info("Verification job still running", "model", model.Name)
+	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+}
+
+// getCleanupJobName returns the name for the cleanup job
+func getCleanupJobName(model *inferencev1alpha1.InferenceModel) string {
+	return model.Name + "-cleanup"
+}
+
+// createCleanupJob creates a job to clean up model files from a shared PVC
+func (r *InferenceModelReconciler) createCleanupJob(ctx context.Context, model *inferencev1alpha1.InferenceModel) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	storage := model.Spec.Storage
+
+	// Determine the PVC name
+	pvcName := storage.PVC
+	if pvcName == "" {
+		pvcName = model.Name + "-models"
+	}
+
+	// Get the model directory to clean up
+	modelDir := getModelDir(model)
+
+	// Check if cleanup job already exists
+	jobName := getCleanupJobName(model)
+	existingJob := &batchv1.Job{}
+	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: model.Namespace}, existingJob)
+	if err == nil {
+		// Job exists, check its status
+		for _, condition := range existingJob.Status.Conditions {
+			if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+				logger.Info("Cleanup job already completed", "model", model.Name, "job", jobName)
+				// Delete the completed job
+				if err := r.Delete(ctx, existingJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+					logger.Error(err, "failed to delete completed cleanup job")
+				}
+				return ctrl.Result{}, nil
+			}
+			if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+				logger.Info("Cleanup job failed, continuing with deletion", "model", model.Name, "job", jobName, "message", condition.Message)
+				return ctrl.Result{}, nil
+			}
+		}
+		// Job is still running, wait for it
+		logger.Info("Cleanup job still running", "model", model.Name, "job", jobName)
+		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		logger.Error(err, "failed to check cleanup job")
+		return ctrl.Result{}, fmt.Errorf("failed to check cleanup job: %w", err)
+	}
+
+	// Build the cleanup job
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: model.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      model.Name,
+				"app.kubernetes.io/component": "model-cleanup",
+				"inference.eh-ops.io/model":   model.Spec.ModelName,
+				"inference.eh-ops.io/managed": "true",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:    "cleanup",
+							Image:   "alpine:3.19",
+							Command: []string{"sh", "-c", fmt.Sprintf("rm -rf %s", modelDir)},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "model-cache",
+									MountPath: "/models",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "model-cache",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+					},
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+				},
+			},
+		},
+	}
+
+	// Set owner reference so the job is deleted when the model is deleted
+	if err := controllerutil.SetControllerReference(model, job, r.Scheme); err != nil {
+		logger.Error(err, "failed to set controller reference on cleanup job")
+		return ctrl.Result{}, fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	// Create the job
+	if err := r.Create(ctx, job); err != nil {
+		if errors.IsAlreadyExists(err) {
+			logger.Info("Cleanup job already exists, requeuing")
+			return ctrl.Result{Requeue: true}, nil
+		}
+		logger.Error(err, "failed to create cleanup job")
+		return ctrl.Result{}, fmt.Errorf("failed to create cleanup job: %w", err)
+	}
+
+	logger.Info("Created cleanup job for model",
+		"model", model.Name,
+		"pvc", pvcName,
+		"model_dir", modelDir,
+		"job", job.Name)
+
+	r.Recorder.Event(model, corev1.EventTypeNormal, "CleanupStarted",
+		fmt.Sprintf("Started cleanup job to remove model files from %s", modelDir))
+
+	// Wait for the job to complete
 	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 }
 
@@ -1030,10 +1412,44 @@ func (r *InferenceModelReconciler) buildResourceRequirements(model *inferencev1a
 func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Skip if already scaled to zero
+	// Check if scaling is disabled
+	scalingDisabled := model.Spec.Scaling.Enabled != nil && !*model.Spec.Scaling.Enabled
+
+	// If scaling is disabled but deployment is at 0 replicas, scale it up
+	if scalingDisabled && deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
+		// Check if we can allocate memory budget before scaling up
+		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
+			logger.Error(fmt.Errorf("insufficient memory budget"), "Cannot scale up deployment, insufficient memory budget",
+				"model", model.Name, "namespace", model.Namespace)
+			r.Recorder.Event(model, corev1.EventTypeWarning, "ScaleUpFailed", "Insufficient memory budget to scale up deployment")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
+		// Allocate memory budget
+		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
+
+		logger.Info("Scaling is disabled, scaling deployment up to 1 replica")
+		replicas := int32(1)
+		deployment.Spec.Replicas = &replicas
+		if err := r.Update(ctx, deployment); err != nil {
+			logger.Error(err, "Failed to scale deployment up")
+			// Release the allocated budget if the update fails
+			r.Tracker.ReleaseModel(model.Name, model.Namespace)
+			return ctrl.Result{}, err
+		}
+		r.Recorder.Event(model, corev1.EventTypeNormal, "ScaledUp", "Scaled deployment to 1 replica (scaling disabled)")
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Skip if already scaled to zero and scaling is enabled
 	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
 		logger.V(1).Info("Model is already scaled to zero")
 		return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+	}
+
+	// If scaling is disabled, don't do idle scaling
+	if scalingDisabled {
+		return ctrl.Result{}, nil
 	}
 
 	// Get cooldown period (default to 10 minutes)
@@ -1408,6 +1824,37 @@ func resourceListsEqual(a, b corev1.ResourceList) bool {
 	return true
 }
 
+// findModelsForBackend finds all InferenceModels that reference a given InferenceBackend
+// and returns reconcile requests for each matching model.
+func (r *InferenceModelReconciler) findModelsForBackend(ctx context.Context, obj client.Object) []reconcile.Request {
+	backend, ok := obj.(*inferencev1alpha1.InferenceBackend)
+	if !ok {
+		return nil
+	}
+
+	// List all InferenceModels in the same namespace as the backend
+	modelList := &inferencev1alpha1.InferenceModelList{}
+	if err := r.List(ctx, modelList, client.InNamespace(backend.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list InferenceModels for backend watch", "backend", backend.Name)
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, model := range modelList.Items {
+		// Check if this model references the backend
+		if model.Spec.Backend == backend.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      model.Name,
+					Namespace: model.Namespace,
+				},
+			})
+		}
+	}
+
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *InferenceModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Initialize the budget tracker if not set
@@ -1419,6 +1866,10 @@ func (r *InferenceModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&inferencev1alpha1.InferenceModel{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&batchv1.Job{}).
+		Watches(
+			&inferencev1alpha1.InferenceBackend{},
+			handler.EnqueueRequestsFromMapFunc(r.findModelsForBackend),
+		).
 		Complete(r)
 }
 

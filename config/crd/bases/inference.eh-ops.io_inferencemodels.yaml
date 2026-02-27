@@ -1366,6 +1366,16 @@ spec:
                           items:
                             type: string
                           type: array
+                        mmprojFile:
+                          description: |-
+                            MmprojFile is the multimodal projector file (for vision models)
+                            If set, $(MMPROJ_SOURCE) in backend args will point to this file
+                          type: string
+                        modelFile:
+                          description: |-
+                            ModelFile is the specific model file to use (for sharded GGUF models)
+                            If set, $(HF_SOURCE) in backend args will point to this file instead of the directory
+                          type: string
                         repo:
                           description: Repo is the HuggingFace repository (e.g., "meta-llama/Llama-3.1-8B-Instruct")
                           minLength: 1

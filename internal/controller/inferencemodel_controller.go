@@ -585,9 +585,6 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 		}
 	}
 
-	// Create symlink to the first .gguf file (for backends that expect a predictable path)
-	fmt.Fprintf(&cmd, " && GGUF_FILE=$(ls %s/*.gguf 2>/dev/null | head -1) && [ -n \"$GGUF_FILE\" ] && ln -sf \"$GGUF_FILE\" %s/model.gguf || true", modelDir, modelDir)
-
 	// Create .ready file when complete
 	fmt.Fprintf(&cmd, " && touch %s/.ready", modelDir)
 
@@ -782,6 +779,37 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 		})
 	}
 
+	// Calculate HF_SOURCE and MMPROJ_SOURCE paths for arg substitution
+	hfSourcePath := ""
+	mmprojSourcePath := ""
+	if model.Spec.Source.HuggingFace != nil {
+		modelDir := getModelDir(model)
+		hf := model.Spec.Source.HuggingFace
+
+		// If modelFile is specified, point to the file; otherwise to the directory
+		if hf.ModelFile != "" {
+			hfSourcePath = fmt.Sprintf("%s/%s", modelDir, hf.ModelFile)
+		} else {
+			hfSourcePath = modelDir
+		}
+
+		// If mmprojFile is specified, set that path too
+		if hf.MmprojFile != "" {
+			mmprojSourcePath = fmt.Sprintf("%s/%s", modelDir, hf.MmprojFile)
+		}
+	} else if model.Spec.Source.PVC != nil {
+		// PVC source
+		pvc := model.Spec.Source.PVC
+		if pvc.ModelFile != "" {
+			hfSourcePath = fmt.Sprintf("%s/%s", pvc.Path, pvc.ModelFile)
+		} else {
+			hfSourcePath = pvc.Path
+		}
+		if pvc.MmprojFile != "" {
+			mmprojSourcePath = fmt.Sprintf("%s/%s", pvc.Path, pvc.MmprojFile)
+		}
+	}
+
 	// Build container
 	container := corev1.Container{
 		Name:            "inference",
@@ -830,7 +858,17 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 	}
 
 	// Set args - start with backend args, then append model args
-	container.Args = append(backend.Spec.Args, model.Spec.Args...)
+	// Substitute $(HF_SOURCE) and $(MMPROJ_SOURCE) with actual paths
+	args := append(backend.Spec.Args, model.Spec.Args...)
+	for i, arg := range args {
+		if hfSourcePath != "" {
+			args[i] = strings.ReplaceAll(arg, "$(HF_SOURCE)", hfSourcePath)
+		}
+		if mmprojSourcePath != "" {
+			args[i] = strings.ReplaceAll(arg, "$(MMPROJ_SOURCE)", mmprojSourcePath)
+		}
+	}
+	container.Args = args
 
 	// Set security context if specified
 	if backend.Spec.SecurityContext != nil {

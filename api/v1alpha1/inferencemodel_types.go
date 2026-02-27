@@ -104,6 +104,14 @@ type HuggingFaceSource struct {
 	// If empty, downloads all files
 	Files []string `json:"files,omitempty"`
 
+	// ModelFile is the specific model file to use (for sharded GGUF models)
+	// If set, $(HF_SOURCE) in backend args will point to this file instead of the directory
+	ModelFile string `json:"modelFile,omitempty"`
+
+	// MmprojFile is the multimodal projector file (for vision models)
+	// If set, $(MMPROJ_SOURCE) in backend args will point to this file
+	MmprojFile string `json:"mmprojFile,omitempty"`
+
 	// ContextSize is the context window size (e.g., "131072" for 128k)
 	ContextSize string `json:"contextSize,omitempty"`
 

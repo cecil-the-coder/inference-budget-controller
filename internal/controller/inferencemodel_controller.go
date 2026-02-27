@@ -564,14 +564,14 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 	cmd.WriteString("export HF_HUB_ENABLE_HF_TRANSFER=1 && ")
 
 	// Create model directory
-	cmd.WriteString(fmt.Sprintf("mkdir -p %s && ", modelDir))
+	fmt.Fprintf(&cmd, "mkdir -p %s && ", modelDir)
 
 	// Build hf download command
-	cmd.WriteString(fmt.Sprintf("hf download ${HF_REPO} --local-dir %s", modelDir))
+	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s", modelDir)
 
 	// Add revision if specified
 	if hf.Revision != "" {
-		cmd.WriteString(fmt.Sprintf(" --revision %s", hf.Revision))
+		fmt.Fprintf(&cmd, " --revision %s", hf.Revision)
 	}
 
 	// Add include patterns for selective download
@@ -586,7 +586,7 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 	}
 
 	// Create .ready file when complete
-	cmd.WriteString(fmt.Sprintf(" && touch %s/.ready", modelDir))
+	fmt.Fprintf(&cmd, " && touch %s/.ready", modelDir)
 
 	return cmd.String()
 }

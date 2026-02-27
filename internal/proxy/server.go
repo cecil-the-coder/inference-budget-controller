@@ -225,7 +225,6 @@ func (s *Server) lookupInferenceModelByName(ctx context.Context, modelName strin
 	return nil, nil
 }
 
-
 // listAllInferenceModels returns all InferenceModels in the configured namespace
 func (s *Server) listAllInferenceModels(ctx context.Context) (*inferencev1alpha1.InferenceModelList, error) {
 	var modelList inferencev1alpha1.InferenceModelList

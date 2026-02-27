@@ -680,7 +680,6 @@ func (s *Server) handleNonStreamingResponse(c *gin.Context, resp *http.Response)
 	}
 }
 
-
 // getNodeSelectorKey generates a key from node selector for logging
 func getNodeSelectorKey(nodeSelector map[string]string) string {
 	if nodeSelector == nil {

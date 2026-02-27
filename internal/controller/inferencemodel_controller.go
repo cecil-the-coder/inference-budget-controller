@@ -373,9 +373,9 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		Env:         envVars,
+		Env:          envVars,
 		VolumeMounts: backend.Spec.VolumeMounts,
-		Resources:   r.buildResourceRequirements(model, backend),
+		Resources:    r.buildResourceRequirements(model, backend),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{

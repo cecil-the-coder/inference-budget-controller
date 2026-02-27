@@ -247,10 +247,10 @@ type SidecarConfig struct {
 type DownloadPhase string
 
 const (
-	DownloadPhasePending    DownloadPhase = "Pending"
+	DownloadPhasePending     DownloadPhase = "Pending"
 	DownloadPhaseDownloading DownloadPhase = "Downloading"
-	DownloadPhaseComplete   DownloadPhase = "Complete"
-	DownloadPhaseFailed     DownloadPhase = "Failed"
+	DownloadPhaseComplete    DownloadPhase = "Complete"
+	DownloadPhaseFailed      DownloadPhase = "Failed"
 )
 
 // InferenceModelStatus defines the observed state of InferenceModel

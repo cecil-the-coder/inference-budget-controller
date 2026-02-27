@@ -1,0 +1,40 @@
+# Basic Model Example
+# This is the simplest InferenceModel configuration
+
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: llama-2-7b
+  labels:
+    environment: development
+    team: ml-platform
+spec:
+  # Required: Model name used in API requests
+  modelName: llama-2-7b
+
+  # Required: Memory requirement for budget calculation
+  memory: 16Gi
+
+  # Required: Backend server URL
+  backendUrl: http://vllm-server:8000
+
+  # Optional: Node pool selection (defaults to {"inference-pool": "default"})
+  nodeSelector:
+    inference-pool: gpu-nodes
+
+  # Optional: How long to wait before scaling to zero (default: 10m)
+  cooldownPeriod: 10m
+
+  # Optional: Container image (required if controller manages the deployment)
+  containerImage: vllm/vllm-openai:latest
+
+  # Optional: Resource requirements
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+      gpu: "1"
+    limits:
+      cpu: "8"
+      memory: "20Gi"
+      gpu: "1"

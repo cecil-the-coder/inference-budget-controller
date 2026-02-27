@@ -1,0 +1,240 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+  name: inferencemodels.inference.eh-ops.io
+spec:
+  group: inference.eh-ops.io
+  names:
+    kind: InferenceModel
+    listKind: InferenceModelList
+    plural: inferencemodels
+    singular: inferencemodel
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.ready
+          name: Ready
+          type: boolean
+        - jsonPath: .status.replicas
+          name: Replicas
+          type: integer
+        - jsonPath: .spec.memory
+          name: Memory
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: InferenceModel is the Schema for the inferencemodels API
+          properties:
+            apiVersion:
+              description: 'APIVersion defines the versioned schema of this representation
+                of an object. Servers should convert recognized schemas to the latest
+                internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+              type: string
+            kind:
+              description: 'Kind is a string value representing the REST resource this
+                object represents. Servers may infer this from the endpoint the client
+                submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: InferenceModelSpec defines the desired state of InferenceModel
+              properties:
+                backendUrl:
+                  description: BackendURL is the URL of the backend inference server
+                  format: uri
+                  type: string
+                containerImage:
+                  description: ContainerImage is the Docker image for the model server
+                  type: string
+                cooldownPeriod:
+                  default: 10m
+                  description: CooldownPeriod is how long to wait before scaling down
+                    an idle model
+                  type: string
+                dependencies:
+                  description: Dependencies are other models that must be running before
+                    this one starts
+                  items:
+                    type: string
+                  type: array
+                maxReplicas:
+                  default: 1
+                  description: MaxReplicas is the maximum number of replicas (default
+                    1 for now)
+                  maximum: 1
+                  minimum: 0
+                  type: integer
+                memory:
+                  description: Memory is the memory requirement for this model (e.g.,
+                    "80Gi")
+                  pattern: ^[0-9]+(Ki|Mi|Gi|Ti)$
+                  type: string
+                modelName:
+                  description: ModelName is the name of the model for API routing
+                  minLength: 1
+                  type: string
+                nodeSelector:
+                  additionalProperties:
+                    type: string
+                  default:
+                    inference-pool: default
+                  description: NodeSelector specifies which node pool this model should
+                    run on
+                  type: object
+                resources:
+                  description: Resources defines the compute resources for the model
+                    container
+                  properties:
+                    limits:
+                      description: Limits are the maximum allowed resources
+                      properties:
+                        cpu:
+                          description: CPU is the CPU requirement
+                          type: string
+                        gpu:
+                          description: GPU is the GPU requirement (e.g., "1" for one
+                            GPU)
+                          type: string
+                        memory:
+                          description: Memory is the memory requirement
+                          type: string
+                      type: object
+                    requests:
+                      description: Requests are the minimum required resources
+                      properties:
+                        cpu:
+                          description: CPU is the CPU requirement
+                          type: string
+                        gpu:
+                          description: GPU is the GPU requirement (e.g., "1" for one
+                            GPU)
+                          type: string
+                        memory:
+                          description: Memory is the memory requirement
+                          type: string
+                      type: object
+                  type: object
+              required:
+                - backendUrl
+                - memory
+                - modelName
+              type: object
+            status:
+              description: InferenceModelStatus defines the observed state of InferenceModel
+              properties:
+                conditions:
+                  description: Conditions represent the latest available observations
+                  items:
+                    description: "Condition contains details for one aspect of the current
+                      state of this API Resource. --- This struct is intended for direct
+                      use as an array at the field path .status.conditions.  For example,
+                      \n type FooStatus struct{ // Represents the observations of a
+                      foo's current state. // Known .status.conditions.type are: \"Available\",
+                      \"Progressing\", and \"Degraded\" // +optional // +patchMergeKey=type
+                      // +patchStrategy=merge // +listType=map // +listMapKey=type Conditions
+                      []metav1.Condition `json:\"conditions,omitempty\" patchStrategy:\"merge\"
+                      patchMergeKey:\"type\" protobuf:\"bytes,1,rep,name=conditions\"`
+                      \n // other fields }"
+                    properties:
+                      lastTransitionTime:
+                        description: lastTransitionTime is the last time the condition
+                          transitioned from one status to another. This should be when
+                          the underlying condition changed.  If that is not known, then
+                          using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: message is a human readable message indicating
+                          details about the transition. This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: observedGeneration represents the .metadata.generation
+                          that the condition was set based upon. For instance, if .metadata.generation
+                          is currently 12, but the .status.conditions[x].observedGeneration
+                          is 9, the condition is out of date with respect to the current
+                          state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: reason contains a programmatic identifier indicating
+                          the reason for the condition's last transition. Producers
+                          of specific condition types may define expected values and
+                          meanings for this field, and whether the values are considered
+                          a guaranteed API. The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: "type of condition in CamelCase or in foo.example.com/CamelCase.
+                          --- Many .condition.type values are consistent across resources
+                          like Available, but in general, any condition key-informative
+                          suffix is valid (for example, .condition.type.Degraded: true
+                          means .condition.type is not empty and roughly means the resource
+                          is broken - more detail to follow). --- There is an exception
+                          to the .condition.type suffix rule: if the type is foo.example.com/Accepted,
+                          we expect to see foo.example.com/Accepted: true and not foo.example.com/AcceptedYes
+                          or foo.example.com/AcceptedYes, and so on."
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                lastObservation:
+                  description: LastObservation is when the metrics were last updated
+                  format: date-time
+                  type: string
+                observedPeakMemory:
+                  description: ObservedPeakMemory is the peak memory observed at runtime
+                  type: string
+                ready:
+                  description: Ready indicates if the model is ready to serve requests
+                  type: boolean
+                recommendation:
+                  description: Recommendation contains suggestions for right-sizing
+                  type: string
+                replicas:
+                  description: Replicas is the current number of replicas
+                  format: int32
+                  type: integer
+                utilizationPercent:
+                  description: UtilizationPercent is the ratio of observed to declared
+                    memory (0-100)
+                  format: int32
+                  type: integer
+              required:
+                - ready
+                - replicas
+              type: object
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

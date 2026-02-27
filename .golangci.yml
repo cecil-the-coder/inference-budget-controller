@@ -1,0 +1,186 @@
+# golangci-lint configuration for inference-budget-controller
+# See https://golangci-lint.run/usage/configuration/
+
+run:
+  # Timeout for running linters
+  timeout: 5m
+
+  # Include test files
+  tests: true
+
+  # List of build tags
+  build-tags: []
+
+  # Skip these directories
+  skip-dirs:
+    - vendor
+    - bin
+    - dist
+
+  # Skip generated files
+  skip-files:
+    - "api/v1alpha1/zz_generated\\.deepcopy\\.go$"
+    - "zz_generated\\..*\\.go$"
+
+  # Modules download mode
+  modules-download-mode: readonly
+
+# Output configuration
+output:
+  # Format: colored-line-number|line-number|json|tab|checkstyle|code-climate
+  format: colored-line-number
+
+  # Print lines of code with issue
+  print-issued-lines: true
+
+  # Print linter name in end of issue text
+  print-linter-name: true
+
+  # Make issues output unique by line
+  uniq-by-line: true
+
+  # Show statistics per linter
+  sort-results: true
+
+# All available linters
+linters:
+  enable:
+    # Formatting
+    - gofmt
+    - goimports
+
+    # Static analysis
+    - govet
+    - staticcheck
+    - typecheck
+
+    # Error checking
+    - errcheck
+
+    # Code quality
+    - ineffassign
+    - gocyclo
+    - dupl
+
+    # Spelling
+    - misspell
+
+  disable:
+    - exhaustivestruct
+    - golint
+    - interfacer
+    - maligned
+    - scopelint
+
+  # Run only fast linters from enabled linters set
+  fast: false
+
+# Linters settings
+linters-settings:
+  errcheck:
+    # Report about not checking of errors in type assertions
+    check-type-assertions: true
+    # Report about assignment of errors to blank identifier
+    check-blank: false
+    # List of functions to exclude from checking
+    exclude-functions:
+      - io/ioutil.ReadFile
+      - io.Copy(*bytes.Buffer)
+      - io.Copy(os.Stdout)
+
+  govet:
+    # Report about shadowed variables
+    check-shadowing: true
+    # Settings per analyzer
+    settings:
+      printf:
+        # Comma-separated list of print function names to check
+        funcs:
+          - (github.com/sirupsen/logrus.FieldLogger).Infof
+          - (github.com/sirupsen/logrus.FieldLogger).Warnf
+          - (github.com/sirupsen/logrus.FieldLogger).Errorf
+          - (github.com/sirupsen/logrus.FieldLogger).Fatalf
+
+  staticcheck:
+    # SAxxxx checks to enable or disable
+    checks: ["all", "-SA1019"]
+
+  gofmt:
+    # Simplify code
+    simplify: true
+
+  goimports:
+    # Put imports beginning with prefix after 3rd-party packages
+    local-prefixes: inference-budget-controller
+
+  gocyclo:
+    # Minimal code complexity to report
+    min-complexity: 15
+
+  dupl:
+    # Tokens count to trigger issue
+    threshold: 150
+
+  misspell:
+    # Correct spellings using locale preferences
+    locale: US
+    ignore-words: []
+
+issues:
+  # List of regexps of issue texts to exclude
+  exclude:
+    # Exclude some linters from running on tests files
+    - "should have a package comment"
+
+  # Excluding configuration per-path, per-linter, per-text and per-source
+  exclude-rules:
+    # Exclude some linters from running on tests files
+    - path: _test\.go
+      linters:
+        - dupl
+        - errcheck
+        - gocyclo
+        - gosec
+
+    # Exclude generated files from all linters
+    - path: 'zz_generated\..*\.go'
+      linters:
+        - all
+
+    # Exclude known linters from partially auto-generated files
+    - path: 'api/v1alpha1/zz_generated\.deepcopy\.go'
+      linters:
+        - goimports
+        - gofmt
+        - dupl
+        - gocyclo
+
+    # Exclude comments on exported types
+    - linters:
+        - revive
+      text: "exported: comment on exported"
+
+  # Independently from option `exclude` we use default exclude patterns
+  exclude-use-default: false
+
+  # Maximum issues count per one linter
+  max-issues-per-linter: 0
+
+  # Maximum count of issues with the same text
+  max-same-issues: 0
+
+  # Show only new issues
+  new: false
+
+  # Fix found issues (if it's supported by the linter)
+  fix: false
+
+severity:
+  # Default value is empty string
+  default-severity: error
+
+  # Rules for overriding default severity
+  rules:
+    - linters:
+        - dupl
+      severity: info

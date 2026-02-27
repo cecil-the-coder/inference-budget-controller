@@ -1,0 +1,89 @@
+# yamllint configuration for inference-budget-controller
+# See https://yamllint.readthedocs.io/
+
+---
+extends: default
+
+rules:
+  # Line length - Kubernetes manifests often have long lines
+  line-length:
+    max: 180
+    level: warning
+
+  # Allow comments to be longer than line length
+  comments:
+    min-spaces-from-content: 1
+
+  # Document start - Kubernetes manifests don't always need ---
+  document-start: disable
+
+  # Truthy values - Kubernetes uses 'on' and 'yes' in some contexts
+  truthy:
+    check-keys: false
+    allowed-values: ['true', 'false']
+    level: warning
+
+  # Comments requirement
+  comments-indentation: disable
+
+  # Empty lines
+  empty-lines:
+    max: 2
+    max-start: 0
+    max-end: 1
+
+  # Hyphens
+  hyphens:
+    max-spaces-after: 1
+
+  # Indentation - Kubernetes uses 2 spaces
+  indentation:
+    spaces: consistent
+    indent-sequences: true
+    check-multi-line-strings: false
+
+  # Key duplicates
+  key-duplicates: enable
+
+  # New line at end of file
+  new-line-at-end-of-file: enable
+
+  # Trailing spaces
+  trailing-spaces: enable
+
+  # Brackets
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+
+  # Braces
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+
+  # Colons
+  colons:
+    max-spaces-before: 0
+    max-spaces-after: 1
+
+  # Commas
+  commas:
+    max-spaces-before: 0
+    min-spaces-after: 1
+    max-spaces-after: 1
+
+  # Octal values - Kubernetes uses both formats
+  octal-values: disable
+
+  # Quoted strings
+  quoted-strings:
+    quote-type: any
+    required: false
+
+# Ignore patterns
+ignore:
+  - vendor/
+  - node_modules/
+  - .git/
+  - bin/
+  - dist/

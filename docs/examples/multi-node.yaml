@@ -1,0 +1,151 @@
+# Multi-Node Pool Configuration Example
+# This example shows how to configure models across different node pools
+# with varying GPU types and memory capacities
+
+---
+# Node Pool 1: NVIDIA A100 80GB GPUs
+# Total Budget: 160Gi (2x 80GB GPUs)
+
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: llama-2-70b
+  labels:
+    environment: production
+    tier: premium
+spec:
+  modelName: llama-2-70b-chat
+  memory: 80Gi
+  backendUrl: http://vllm-a100:8000
+  nodeSelector:
+    inference-pool: gpu-a100
+    gpu-type: nvidia-a100-80gb
+  cooldownPeriod: 20m
+  maxReplicas: 1
+  containerImage: vllm/vllm-openai:latest
+  resources:
+    requests:
+      cpu: "16"
+      memory: "80Gi"
+      gpu: "1"
+    limits:
+      cpu: "32"
+      memory: "100Gi"
+      gpu: "1"
+
+---
+# Another model on the same A100 pool
+# This model will share the 160Gi budget with llama-2-70b
+
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: codellama-34b
+  labels:
+    environment: production
+    tier: standard
+spec:
+  modelName: codellama-34b-instruct
+  memory: 48Gi
+  backendUrl: http://vllm-a100:8001
+  nodeSelector:
+    inference-pool: gpu-a100
+    gpu-type: nvidia-a100-80gb
+  cooldownPeriod: 15m
+  containerImage: vllm/vllm-openai:latest
+  resources:
+    requests:
+      cpu: "8"
+      memory: "48Gi"
+      gpu: "1"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
+      gpu: "1"
+
+---
+# Node Pool 2: NVIDIA V100 32GB GPUs
+# Total Budget: 64Gi (2x 32GB GPUs)
+
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: mistral-7b
+  labels:
+    environment: production
+    tier: standard
+spec:
+  modelName: mistral-7b-instruct
+  memory: 16Gi
+  backendUrl: http://vllm-v100:8000
+  nodeSelector:
+    inference-pool: gpu-v100
+    gpu-type: nvidia-v100-32gb
+  cooldownPeriod: 10m
+  containerImage: vllm/vllm-openai:latest
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+      gpu: "1"
+    limits:
+      cpu: "8"
+      memory: "20Gi"
+      gpu: "1"
+
+---
+# Node Pool 3: CPU-only nodes for small models
+# Total Budget: 256Gi (CPU memory)
+
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: embedding-model
+  labels:
+    environment: production
+    tier: basic
+spec:
+  modelName: all-minilm-l6-v2
+  memory: 2Gi
+  backendUrl: http://embedding-server:8000
+  nodeSelector:
+    inference-pool: cpu-only
+  cooldownPeriod: 5m
+  containerImage: ghcr.io/huggingface/text-embeddings-inference:latest
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+
+---
+# Model with dependencies
+# This model requires another model to be running first
+
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: reranker-model
+  labels:
+    environment: production
+    component: pipeline
+spec:
+  modelName: bge-reranker-base
+  memory: 4Gi
+  backendUrl: http://reranker-server:8000
+  nodeSelector:
+    inference-pool: cpu-only
+  cooldownPeriod: 15m
+  # This model depends on the embedding model being available
+  dependencies:
+    - all_minilm_l6_v2
+  containerImage: ghcr.io/huggingface/text-embeddings-inference:latest
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"

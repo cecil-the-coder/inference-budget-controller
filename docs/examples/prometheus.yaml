@@ -1,0 +1,133 @@
+# Prometheus Scrape Configuration for Inference Budget Controller
+# Add this to your Prometheus configuration
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # ... your existing scrape configs ...
+
+      # Inference Budget Controller metrics
+      - job_name: 'inference-budget-controller'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - inference-budget-controller-system
+        relabel_configs:
+          # Only scrape pods with the control-plane label
+          - source_labels: [__meta_kubernetes_pod_label_control_plane]
+            action: keep
+            regex: controller-manager
+          # Use the pod IP and metrics port
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: $1:8080
+          # Add namespace label
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+          # Add pod name label
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: kubernetes_pod_name
+
+---
+# Alternative: Scrape via ServiceMonitor (if using Prometheus Operator)
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: inference-budget-controller
+  namespace: monitoring
+  labels:
+    release: prometheus  # Adjust to match your Prometheus release label
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inference-budget-controller
+  namespaceSelector:
+    matchNames:
+      - inference-budget-controller-system
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+
+---
+# Service to expose metrics (if not already present)
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-budget-controller-metrics
+  namespace: inference-budget-controller-system
+  labels:
+    app.kubernetes.io/name: inference-budget-controller
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    control-plane: controller-manager
+
+---
+# Example PrometheusRule for alerts (Prometheus Operator)
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: inference-budget-controller-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: inference-budget-controller
+      rules:
+        - alert: NoInferenceModelsReady
+          expr: sum(inference_model_ready) == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: No inference models are ready
+            description: "All inference models are in a not-ready state."
+
+        - alert: HighMemoryUtilization
+          expr: |
+            sum(inference_budget_allocated_bytes) / sum(inference_budget_total_bytes) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Memory budget is nearly exhausted
+            description: "Over 90% of memory budget is allocated."
+
+        - alert: ModelNotReady
+          expr: inference_model_ready == 0 and inference_model_replicas > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Model {{ $labels.model }} is not becoming ready
+            description: "Model has replicas but is not ready after 10 minutes."
+
+        - alert: ModelOverprovisioned
+          expr: inference_model_memory_utilization_ratio < 0.7
+          for: 1h
+          labels:
+            severity: info
+          annotations:
+            summary: Model {{ $labels.model }} is overprovisioned
+            description: "Model is using less than 70% of declared memory."

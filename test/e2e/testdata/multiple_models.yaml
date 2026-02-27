@@ -1,0 +1,38 @@
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: small-model
+  namespace: inference-system
+spec:
+  modelName: small-llm
+  memory: 1Gi
+  backendUrl: http://small-backend:8080
+  containerImage: nginx:alpine
+  cooldownPeriod: 5m
+  maxReplicas: 1
+  nodeSelector:
+    inference-pool: cpu-pool
+---
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: large-model
+  namespace: inference-system
+spec:
+  modelName: large-llm
+  memory: 80Gi
+  backendUrl: http://large-backend:8080
+  containerImage: nginx:alpine
+  cooldownPeriod: 30m
+  maxReplicas: 1
+  nodeSelector:
+    inference-pool: gpu-pool
+  resources:
+    requests:
+      cpu: "4"
+      memory: "80Gi"
+      gpu: "1"
+    limits:
+      cpu: "8"
+      memory: "100Gi"
+      gpu: "1"

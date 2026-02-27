@@ -1,0 +1,14 @@
+apiVersion: inference.eh-ops.io/v1alpha1
+kind: InferenceModel
+metadata:
+  name: sample-model
+  namespace: inference-system
+spec:
+  modelName: gpt-sample
+  memory: 4Gi
+  backendUrl: http://localhost:8080
+  containerImage: nginx:alpine
+  cooldownPeriod: 10m
+  maxReplicas: 1
+  nodeSelector:
+    inference-pool: default

@@ -1067,17 +1067,19 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 }
 
-// buildDeployment creates a Deployment spec from an InferenceModel and InferenceBackend
-func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (*appsv1.Deployment, error) {
-	labels := map[string]string{
+// buildDeploymentLabels creates standard labels for the deployment and pods
+func buildDeploymentLabels(model *inferencev1alpha1.InferenceModel) map[string]string {
+	return map[string]string{
 		"app.kubernetes.io/name":      model.Name,
 		"app.kubernetes.io/component": "inference-server",
 		"inference.eh-ops.io/model":   model.Spec.ModelName,
 		"inference.eh-ops.io/backend": model.Spec.Backend,
 		"inference.eh-ops.io/managed": "true",
 	}
+}
 
-	// Determine the port to use (allow override from model)
+// resolvePort determines the port to use from backend or model overrides
+func resolvePort(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) int32 {
 	port := backend.Spec.Port
 	if port == 0 {
 		port = DefaultContainerPort
@@ -1085,124 +1087,134 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Port != nil {
 		port = *model.Spec.BackendOverrides.Port
 	}
+	return port
+}
 
-	// Determine the image to use (allow override from model)
+// resolveImage determines the image to use from backend or model overrides
+func resolveImage(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) string {
 	imageRef := &backend.Spec.Image
 	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Image != nil {
 		imageRef = model.Spec.BackendOverrides.Image
 	}
-	image := imageRef.GetImage()
+	return imageRef.GetImage()
+}
 
-	// Determine probe paths (allow override from model)
-	readinessPath := backend.Spec.ReadinessPath
-	if readinessPath == "" {
-		readinessPath = "/health"
+// resolveProbePaths determines readiness and liveness probe paths
+func resolveProbePaths(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (readiness, liveness string) {
+	readiness = backend.Spec.ReadinessPath
+	if readiness == "" {
+		readiness = "/health"
 	}
 	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.ReadinessPath != nil {
-		readinessPath = *model.Spec.BackendOverrides.ReadinessPath
+		readiness = *model.Spec.BackendOverrides.ReadinessPath
 	}
 
-	livenessPath := backend.Spec.LivenessPath
-	if livenessPath == "" {
-		livenessPath = readinessPath
+	liveness = backend.Spec.LivenessPath
+	if liveness == "" {
+		liveness = readiness
 	}
+	return readiness, liveness
+}
 
-	// Build environment variables - start with backend env, then add model-specific
+// buildContainerEnv builds environment variables for the container
+func buildContainerEnv(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend, port int32) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
-		{
-			Name:  "MODEL_NAME",
-			Value: model.Spec.ModelName,
-		},
-		{
-			Name:  "BACKEND_URL",
-			Value: fmt.Sprintf("http://localhost:%d", port),
-		},
-		{
-			Name:  "PORT",
-			Value: fmt.Sprintf("%d", port),
-		},
+		{Name: "MODEL_NAME", Value: model.Spec.ModelName},
+		{Name: "BACKEND_URL", Value: fmt.Sprintf("http://localhost:%d", port)},
+		{Name: "PORT", Value: fmt.Sprintf("%d", port)},
 	}
-	// Add backend env vars
 	envVars = append(envVars, backend.Spec.Env...)
-	// Add model env vars (can override backend)
 	envVars = append(envVars, model.Spec.Env...)
+	return envVars
+}
 
-	// Build volumeMounts - start with backend volumeMounts
+// buildVolumeConfig builds volumes and volume mounts for the pod
+func buildVolumeConfig(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) ([]corev1.Volume, []corev1.VolumeMount) {
+	volumes := append([]corev1.Volume{}, backend.Spec.Volumes...)
 	volumeMounts := append([]corev1.VolumeMount{}, backend.Spec.VolumeMounts...)
 
-	// Build volumes - start with backend volumes
-	volumes := append([]corev1.Volume{}, backend.Spec.Volumes...)
-
-	// If using HuggingFace source with a PVC, add model-cache volume and set HF_SOURCE
 	if model.Spec.Source.HuggingFace != nil && model.Spec.Storage.PVC != "" {
-		// Add the model-cache PVC volume
-		modelCacheVolume := corev1.Volume{
+		volumes = append(volumes, corev1.Volume{
 			Name: "model-cache",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: model.Spec.Storage.PVC,
 				},
 			},
-		}
-		volumes = append(volumes, modelCacheVolume)
-
-		// Add volumeMount for /models
-		modelCacheMount := corev1.VolumeMount{
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      "model-cache",
 			MountPath: "/models",
-		}
-		volumeMounts = append(volumeMounts, modelCacheMount)
-
-		// Set HF_SOURCE to the model directory path
-		modelDir := getModelDir(model)
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "HF_SOURCE",
-			Value: modelDir,
 		})
 	}
+	return volumes, volumeMounts
+}
 
-	// Calculate HF_SOURCE and MMPROJ_SOURCE paths for arg substitution
-	hfSourcePath := ""
-	mmprojSourcePath := ""
+// sourcePaths contains the resolved paths for model files
+type sourcePaths struct {
+	hfSource     string
+	mmprojSource string
+}
+
+// resolveSourcePaths calculates HF_SOURCE and MMPROJ_SOURCE paths for arg substitution
+func resolveSourcePaths(model *inferencev1alpha1.InferenceModel) sourcePaths {
+	var paths sourcePaths
+
 	if model.Spec.Source.HuggingFace != nil {
 		modelDir := getModelDir(model)
 		hf := model.Spec.Source.HuggingFace
-
-		// If modelFile is specified, point to the file; otherwise to the directory
 		if hf.ModelFile != "" {
-			hfSourcePath = fmt.Sprintf("%s/%s", modelDir, hf.ModelFile)
+			paths.hfSource = fmt.Sprintf("%s/%s", modelDir, hf.ModelFile)
 		} else {
-			hfSourcePath = modelDir
+			paths.hfSource = modelDir
 		}
-
-		// If mmprojFile is specified, set that path too
 		if hf.MmprojFile != "" {
-			mmprojSourcePath = fmt.Sprintf("%s/%s", modelDir, hf.MmprojFile)
+			paths.mmprojSource = fmt.Sprintf("%s/%s", modelDir, hf.MmprojFile)
 		}
 	} else if model.Spec.Source.PVC != nil {
-		// PVC source
 		pvc := model.Spec.Source.PVC
 		if pvc.ModelFile != "" {
-			hfSourcePath = fmt.Sprintf("%s/%s", pvc.Path, pvc.ModelFile)
+			paths.hfSource = fmt.Sprintf("%s/%s", pvc.Path, pvc.ModelFile)
 		} else {
-			hfSourcePath = pvc.Path
+			paths.hfSource = pvc.Path
 		}
 		if pvc.MmprojFile != "" {
-			mmprojSourcePath = fmt.Sprintf("%s/%s", pvc.Path, pvc.MmprojFile)
+			paths.mmprojSource = fmt.Sprintf("%s/%s", pvc.Path, pvc.MmprojFile)
 		}
 	}
+	return paths
+}
 
-	// Build container
+// buildContainerArgs builds args with variable substitution
+func buildContainerArgs(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend, paths sourcePaths) []string {
+	args := append(backend.Spec.Args, model.Spec.Args...)
+	for i, arg := range args {
+		if paths.hfSource != "" {
+			args[i] = strings.ReplaceAll(arg, "$(HF_SOURCE)", paths.hfSource)
+		}
+		if paths.mmprojSource != "" {
+			args[i] = strings.ReplaceAll(arg, "$(MMPROJ_SOURCE)", paths.mmprojSource)
+		}
+	}
+	return args
+}
+
+// buildMainContainer creates the main inference container
+func (r *InferenceModelReconciler) buildMainContainer(
+	model *inferencev1alpha1.InferenceModel,
+	backend *inferencev1alpha1.InferenceBackend,
+	port int32,
+	readinessPath, livenessPath string,
+	envVars []corev1.EnvVar,
+	volumeMounts []corev1.VolumeMount,
+	args []string,
+) corev1.Container {
 	container := corev1.Container{
 		Name:            "inference",
-		Image:           image,
+		Image:           resolveImage(model, backend),
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Ports: []corev1.ContainerPort{
-			{
-				Name:          "http",
-				ContainerPort: port,
-				Protocol:      corev1.ProtocolTCP,
-			},
+			{Name: "http", ContainerPort: port, Protocol: corev1.ProtocolTCP},
 		},
 		Env:          envVars,
 		VolumeMounts: volumeMounts,
@@ -1214,11 +1226,8 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 					Port: intstr.FromInt(int(port)),
 				},
 			},
-			InitialDelaySeconds: 30,
-			PeriodSeconds:       10,
-			TimeoutSeconds:      5,
-			SuccessThreshold:    1,
-			FailureThreshold:    3,
+			InitialDelaySeconds: 30, PeriodSeconds: 10, TimeoutSeconds: 5,
+			SuccessThreshold: 1, FailureThreshold: 3,
 		},
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
@@ -1227,59 +1236,44 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 					Port: intstr.FromInt(int(port)),
 				},
 			},
-			InitialDelaySeconds: 60,
-			PeriodSeconds:       30,
-			TimeoutSeconds:      5,
-			FailureThreshold:    3,
+			InitialDelaySeconds: 60, PeriodSeconds: 30, TimeoutSeconds: 5, FailureThreshold: 3,
 		},
+		Args: args,
 	}
 
-	// Set command if specified
 	if len(backend.Spec.Command) > 0 {
 		container.Command = backend.Spec.Command
 	}
-
-	// Set args - start with backend args, then append model args
-	// Substitute $(HF_SOURCE) and $(MMPROJ_SOURCE) with actual paths
-	args := append(backend.Spec.Args, model.Spec.Args...)
-	for i, arg := range args {
-		if hfSourcePath != "" {
-			args[i] = strings.ReplaceAll(arg, "$(HF_SOURCE)", hfSourcePath)
-		}
-		if mmprojSourcePath != "" {
-			args[i] = strings.ReplaceAll(arg, "$(MMPROJ_SOURCE)", mmprojSourcePath)
-		}
-	}
-	container.Args = args
-
-	// Set security context if specified
 	if backend.Spec.SecurityContext != nil {
 		container.SecurityContext = backend.Spec.SecurityContext
 	}
+	return container
+}
 
-	// Build pod spec
+// buildPodSpec creates the pod spec for the deployment
+func buildPodSpec(
+	model *inferencev1alpha1.InferenceModel,
+	backend *inferencev1alpha1.InferenceBackend,
+	container corev1.Container,
+	volumes []corev1.Volume,
+) corev1.PodSpec {
 	podSpec := corev1.PodSpec{
 		Containers:   []corev1.Container{container},
 		NodeSelector: model.Spec.NodeSelector,
 		Volumes:      volumes,
 	}
 
-	// Add tolerations from model
 	if len(model.Spec.Tolerations) > 0 {
 		podSpec.Tolerations = model.Spec.Tolerations
 	}
-
-	// Add affinity from model
 	if model.Spec.Affinity != nil {
 		podSpec.Affinity = model.Spec.Affinity
 	}
-
-	// Add init containers from backend
 	if len(backend.Spec.InitContainers) > 0 {
 		podSpec.InitContainers = backend.Spec.InitContainers
 	}
 
-	// Add sidecar from model if specified
+	// Add sidecar if specified
 	if model.Spec.Sidecar != nil {
 		sidecar := corev1.Container{
 			Name:  model.Spec.Sidecar.Name,
@@ -1297,24 +1291,43 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 		podSpec.Containers = append(podSpec.Containers, sidecar)
 	}
 
-	// Add tolerations for GPU nodes if GPU is configured
+	// Add GPU tolerations if needed
 	gpuConfig := backend.Spec.GPU
 	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.GPU != nil {
 		gpuConfig = model.Spec.BackendOverrides.GPU
 	}
-	if gpuConfig != nil && (gpuConfig.Exclusive || gpuConfig.Shared) {
-		if len(podSpec.Tolerations) == 0 {
-			podSpec.Tolerations = []corev1.Toleration{
-				{
-					Key:      "nvidia.com/gpu",
-					Operator: corev1.TolerationOpExists,
-					Effect:   corev1.TaintEffectNoSchedule,
-				},
-			}
+	if gpuConfig != nil && (gpuConfig.Exclusive || gpuConfig.Shared) && len(podSpec.Tolerations) == 0 {
+		podSpec.Tolerations = []corev1.Toleration{
+			{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
 		}
 	}
 
-	// Build deployment
+	return podSpec
+}
+
+// buildDeployment creates a Deployment spec from an InferenceModel and InferenceBackend
+func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (*appsv1.Deployment, error) {
+	labels := buildDeploymentLabels(model)
+	port := resolvePort(model, backend)
+	readinessPath, livenessPath := resolveProbePaths(model, backend)
+
+	envVars := buildContainerEnv(model, backend, port)
+	volumes, volumeMounts := buildVolumeConfig(model, backend)
+
+	// Add HF_SOURCE env var for HuggingFace models
+	if model.Spec.Source.HuggingFace != nil && model.Spec.Storage.PVC != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "HF_SOURCE",
+			Value: getModelDir(model),
+		})
+	}
+
+	paths := resolveSourcePaths(model)
+	args := buildContainerArgs(model, backend, paths)
+
+	container := r.buildMainContainer(model, backend, port, readinessPath, livenessPath, envVars, volumeMounts, args)
+	podSpec := buildPodSpec(model, backend, container, volumes)
+
 	replicas := model.Spec.Scaling.MaxReplicas
 	if replicas == 0 {
 		replicas = 1
@@ -1333,9 +1346,7 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app.kubernetes.io/name": model.Name,
-				},
+				MatchLabels: map[string]string{"app.kubernetes.io/name": model.Name},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{

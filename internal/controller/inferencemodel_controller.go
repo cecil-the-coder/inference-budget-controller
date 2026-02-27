@@ -745,6 +745,40 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 	// Add model env vars (can override backend)
 	envVars = append(envVars, model.Spec.Env...)
 
+	// Build volumeMounts - start with backend volumeMounts
+	volumeMounts := append([]corev1.VolumeMount{}, backend.Spec.VolumeMounts...)
+
+	// Build volumes - start with backend volumes
+	volumes := append([]corev1.Volume{}, backend.Spec.Volumes...)
+
+	// If using HuggingFace source with a PVC, add model-cache volume and set HF_SOURCE
+	if model.Spec.Source.HuggingFace != nil && model.Spec.Storage.PVC != "" {
+		// Add the model-cache PVC volume
+		modelCacheVolume := corev1.Volume{
+			Name: "model-cache",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: model.Spec.Storage.PVC,
+				},
+			},
+		}
+		volumes = append(volumes, modelCacheVolume)
+
+		// Add volumeMount for /models
+		modelCacheMount := corev1.VolumeMount{
+			Name:      "model-cache",
+			MountPath: "/models",
+		}
+		volumeMounts = append(volumeMounts, modelCacheMount)
+
+		// Set HF_SOURCE to the model directory path
+		modelDir := getModelDir(model)
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "HF_SOURCE",
+			Value: modelDir,
+		})
+	}
+
 	// Build container
 	container := corev1.Container{
 		Name:            "inference",
@@ -758,7 +792,7 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 			},
 		},
 		Env:          envVars,
-		VolumeMounts: backend.Spec.VolumeMounts,
+		VolumeMounts: volumeMounts,
 		Resources:    r.buildResourceRequirements(model, backend),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
@@ -804,7 +838,7 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 	podSpec := corev1.PodSpec{
 		Containers:   []corev1.Container{container},
 		NodeSelector: model.Spec.NodeSelector,
-		Volumes:      backend.Spec.Volumes,
+		Volumes:      volumes,
 	}
 
 	// Add tolerations from model

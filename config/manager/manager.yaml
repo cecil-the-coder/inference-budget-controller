@@ -9,13 +9,13 @@ metadata:
     app.kubernetes.io/part-of: inference-budget-controller
     app.kubernetes.io/managed-by: kustomize
     control-plane: controller-manager
-  name: system
+  name: inference
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: controller-manager
-  namespace: system
+  namespace: inference
   labels:
     app.kubernetes.io/name: inference-budget-controller
     app.kubernetes.io/instance: controller-manager
@@ -65,7 +65,7 @@ spec:
             capabilities:
               drop:
                 - "ALL"
-            livenessProbe:
+          livenessProbe:
             httpGet:
               path: /healthz
               port: 8081

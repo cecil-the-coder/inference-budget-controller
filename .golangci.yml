@@ -1,19 +1,8 @@
-# golangci-lint configuration for inference-budget-controller
-# See https://golangci-lint.run/usage/configuration/
-
 version: "2"
 
 run:
   timeout: 5m
   tests: true
-
-output:
-  formats:
-    text:
-      path: stdout
-      print-issued-lines: true
-      print-linter-name: true
-  sort-results: true
 
 linters:
   enable:
@@ -27,60 +16,32 @@ linters:
     - dupl
     - misspell
 
-  disable:
-    - exhaustivestruct
-    - golint
-    - interfacer
-    - maligned
-    - scopelint
+  exclusions:
+    generated:
+      - 'api/v1alpha1/zz_generated\.deepcopy\.go'
+    paths:
+      - vendor
+      - bin
+      - dist
+    rules:
+      - path: _test\.go
+        linters:
+          - dupl
+          - errcheck
+          - gocyclo
+      - path: 'api/v1alpha1/zz_generated\.deepcopy\.go'
+        linters:
+          - goimports
+          - gofmt
+          - dupl
+          - gocyclo
 
-linters-settings:
+settings:
   errcheck:
     check-type-assertions: true
-    check-blank: false
-
-  staticcheck:
-    checks: ["all", "-SA1019"]
-
-  gofmt:
-    simplify: true
-
-  goimports:
-    local-prefixes: github.com/cecil-the-coder/inference-budget-controller
-
   gocyclo:
     min-complexity: 15
-
   dupl:
     threshold: 150
-
   misspell:
     locale: US
-
-issues:
-  exclude-dirs:
-    - vendor
-    - bin
-    - dist
-
-  exclude-files:
-    - "api/v1alpha1/zz_generated\\.deepcopy\\.go$"
-    - "zz_generated\\..*\\.go$"
-
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - dupl
-        - errcheck
-        - gocyclo
-        - gosec
-
-    - path: 'api/v1alpha1/zz_generated\.deepcopy\.go'
-      linters:
-        - goimports
-        - gofmt
-        - dupl
-        - gocyclo
-
-  max-issues-per-linter: 0
-  max-same-issues: 0

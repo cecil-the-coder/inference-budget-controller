@@ -36,6 +36,7 @@ import (
 	"github.com/cecil-the-coder/inference-budget-controller/internal/controller"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/proxy"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/registry"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -101,11 +102,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize budget tracker
+	budgetTracker := budget.NewTracker()
+
+	// Initialize deployment registry
+	deploymentRegistry := registry.NewRegistry()
+
 	if err = (&controller.InferenceModelReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("inferencemodel-controller"),
 		Metrics:  metricsCollector,
+		Registry: deploymentRegistry,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceModel")
 		os.Exit(1)
@@ -121,9 +129,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize budget tracker
-	budgetTracker := budget.NewTracker()
-
 	// Initialize and start proxy server
 	proxyServer := proxy.NewServer(
 		proxyAddr,
@@ -132,6 +137,7 @@ func main() {
 		scheme,
 		proxy.WithNamespace(proxyNamespace),
 		proxy.WithMetrics(metricsCollector),
+		proxy.WithRegistry(deploymentRegistry),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

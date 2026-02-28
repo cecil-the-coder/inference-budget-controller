@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,10 +34,16 @@ import (
 
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/registry"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const (
@@ -116,43 +124,133 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 			"utilization_percent", model.Status.UtilizationPercent,
 		)
 
-		// 2. Check if model is ready
-		if !model.Status.Ready {
-			// Model is not ready, check if we can scale it up
-			if !s.canScaleUp(ctx, model) {
-				// Cannot allocate memory, return 429
-				s.handleInsufficientMemory(c, model)
-				return
+		namespace := model.Namespace
+		modelName := model.Name
+
+		// 2. Check registry for deployment state and ensure deployment exists
+		if s.Registry != nil {
+			entry := s.Registry.Get(namespace, modelName)
+			var state registry.DeploymentState
+			if entry == nil {
+				state = registry.StateNonexistent
+			} else {
+				state = entry.State
 			}
 
-			// Trigger scale-up and wait for readiness
-			if err := s.triggerScaleUp(ctx, model); err != nil {
-				logger.Error(err, "Failed to trigger scale-up")
-				c.JSON(http.StatusInternalServerError, ErrorResponse{
-					Error: ErrorDetail{
-						Message: "Failed to scale up model: " + err.Error(),
-						Type:    "server_error",
-						Code:    "scale_up_failed",
-					},
-				})
-				return
-			}
+			switch state {
+			case registry.StateNonexistent:
+				// Deployment doesn't exist, need to create it
+				logger.Info("Deployment nonexistent, creating on-demand",
+					"namespace", namespace,
+					"model", modelName,
+				)
 
-			// Wait for model to become ready
-			if err := s.waitForModelReady(ctx, model); err != nil {
-				logger.Error(err, "Model failed to become ready")
-				c.JSON(http.StatusServiceUnavailable, ErrorResponse{
-					Error: ErrorDetail{
-						Message: "Model failed to become ready: " + err.Error(),
-						Type:    "server_error",
-						Code:    "model_not_ready",
-					},
-				})
-				return
+				if err := s.ensureDeployment(ctx, model); err != nil {
+					logger.Error(err, "Failed to ensure deployment")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Failed to create deployment: " + err.Error(),
+							Type:    "server_error",
+							Code:    "deployment_failed",
+						},
+					})
+					return
+				}
+
+			case registry.StateCreating:
+				// Deployment is being created, wait for it to be ready
+				logger.Info("Deployment creating, waiting for ready state",
+					"namespace", namespace,
+					"model", modelName,
+				)
+
+				if err := s.waitForDeploymentReady(ctx, model); err != nil {
+					logger.Error(err, "Timed out waiting for deployment to become ready")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Deployment is taking too long to become ready: " + err.Error(),
+							Type:    "server_error",
+							Code:    "deployment_timeout",
+						},
+					})
+					return
+				}
+
+			case registry.StateReady:
+				// Deployment is ready, proceed
+				logger.V(1).Info("Deployment already ready",
+					"namespace", namespace,
+					"model", modelName,
+				)
+
+			case registry.StateDeleting:
+				// Deployment is being deleted, wait and recreate
+				logger.Info("Deployment is being deleted, waiting and recreating",
+					"namespace", namespace,
+					"model", modelName,
+				)
+
+				if err := s.waitForDeploymentDeleted(ctx, model); err != nil {
+					logger.Error(err, "Failed waiting for deployment deletion")
+				}
+
+				if err := s.ensureDeployment(ctx, model); err != nil {
+					logger.Error(err, "Failed to recreate deployment")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Failed to recreate deployment: " + err.Error(),
+							Type:    "server_error",
+							Code:    "deployment_failed",
+						},
+					})
+					return
+				}
+			}
+		} else {
+			// Fallback to legacy behavior when registry is not available
+			if !model.Status.Ready {
+				if !s.canScaleUp(ctx, model) {
+					s.handleInsufficientMemory(c, model)
+					return
+				}
+
+				if err := s.triggerScaleUp(ctx, model); err != nil {
+					logger.Error(err, "Failed to trigger scale-up")
+					c.JSON(http.StatusInternalServerError, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Failed to scale up model: " + err.Error(),
+							Type:    "server_error",
+							Code:    "scale_up_failed",
+						},
+					})
+					return
+				}
+
+				if err := s.waitForModelReady(ctx, model); err != nil {
+					logger.Error(err, "Model failed to become ready")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Model failed to become ready: " + err.Error(),
+							Type:    "server_error",
+							Code:    "model_not_ready",
+						},
+					})
+					return
+				}
 			}
 		}
 
-		// 3. Forward request to backend
+		// 3. Record request in registry before forwarding
+		if s.Registry != nil {
+			s.Registry.RecordRequest(namespace, modelName)
+		}
+
+		// 4. Forward request to backend (with defer to finish request tracking)
+		defer func() {
+			if s.Registry != nil {
+				s.Registry.FinishRequest(namespace, modelName)
+			}
+		}()
 		s.forwardToBackend(c, model, bodyBytes, &req, backendPath, startTime)
 	}
 }
@@ -213,39 +311,133 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 			"utilization_percent", model.Status.UtilizationPercent,
 		)
 
-		// 2. Check if model is ready
-		if !model.Status.Ready {
-			if !s.canScaleUp(ctx, model) {
-				s.handleInsufficientMemory(c, model)
-				return
+		namespace := model.Namespace
+		deploymentName := model.Name
+
+		// 2. Check registry for deployment state and ensure deployment exists
+		if s.Registry != nil {
+			entry := s.Registry.Get(namespace, deploymentName)
+			var state registry.DeploymentState
+			if entry == nil {
+				state = registry.StateNonexistent
+			} else {
+				state = entry.State
 			}
 
-			if err := s.triggerScaleUp(ctx, model); err != nil {
-				logger.Error(err, "Failed to trigger scale-up")
-				c.JSON(http.StatusInternalServerError, ErrorResponse{
-					Error: ErrorDetail{
-						Message: "Failed to scale up model: " + err.Error(),
-						Type:    "server_error",
-						Code:    "scale_up_failed",
-					},
-				})
-				return
-			}
+			switch state {
+			case registry.StateNonexistent:
+				// Deployment doesn't exist, need to create it
+				logger.Info("Deployment nonexistent, creating on-demand",
+					"namespace", namespace,
+					"model", deploymentName,
+				)
 
-			if err := s.waitForModelReady(ctx, model); err != nil {
-				logger.Error(err, "Model failed to become ready")
-				c.JSON(http.StatusServiceUnavailable, ErrorResponse{
-					Error: ErrorDetail{
-						Message: "Model failed to become ready: " + err.Error(),
-						Type:    "server_error",
-						Code:    "model_not_ready",
-					},
-				})
-				return
+				if err := s.ensureDeployment(ctx, model); err != nil {
+					logger.Error(err, "Failed to ensure deployment")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Failed to create deployment: " + err.Error(),
+							Type:    "server_error",
+							Code:    "deployment_failed",
+						},
+					})
+					return
+				}
+
+			case registry.StateCreating:
+				// Deployment is being created, wait for it to be ready
+				logger.Info("Deployment creating, waiting for ready state",
+					"namespace", namespace,
+					"model", deploymentName,
+				)
+
+				if err := s.waitForDeploymentReady(ctx, model); err != nil {
+					logger.Error(err, "Timed out waiting for deployment to become ready")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Deployment is taking too long to become ready: " + err.Error(),
+							Type:    "server_error",
+							Code:    "deployment_timeout",
+						},
+					})
+					return
+				}
+
+			case registry.StateReady:
+				// Deployment is ready, proceed
+				logger.V(1).Info("Deployment already ready",
+					"namespace", namespace,
+					"model", deploymentName,
+				)
+
+			case registry.StateDeleting:
+				// Deployment is being deleted, wait and recreate
+				logger.Info("Deployment is being deleted, waiting and recreating",
+					"namespace", namespace,
+					"model", deploymentName,
+				)
+
+				if err := s.waitForDeploymentDeleted(ctx, model); err != nil {
+					logger.Error(err, "Failed waiting for deployment deletion")
+				}
+
+				if err := s.ensureDeployment(ctx, model); err != nil {
+					logger.Error(err, "Failed to recreate deployment")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Failed to recreate deployment: " + err.Error(),
+							Type:    "server_error",
+							Code:    "deployment_failed",
+						},
+					})
+					return
+				}
+			}
+		} else {
+			// Fallback to legacy behavior when registry is not available
+			if !model.Status.Ready {
+				if !s.canScaleUp(ctx, model) {
+					s.handleInsufficientMemory(c, model)
+					return
+				}
+
+				if err := s.triggerScaleUp(ctx, model); err != nil {
+					logger.Error(err, "Failed to trigger scale-up")
+					c.JSON(http.StatusInternalServerError, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Failed to scale up model: " + err.Error(),
+							Type:    "server_error",
+							Code:    "scale_up_failed",
+						},
+					})
+					return
+				}
+
+				if err := s.waitForModelReady(ctx, model); err != nil {
+					logger.Error(err, "Model failed to become ready")
+					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+						Error: ErrorDetail{
+							Message: "Model failed to become ready: " + err.Error(),
+							Type:    "server_error",
+							Code:    "model_not_ready",
+						},
+					})
+					return
+				}
 			}
 		}
 
-		// 3. Forward the original request to backend (preserving multipart body)
+		// 3. Record request in registry before forwarding
+		if s.Registry != nil {
+			s.Registry.RecordRequest(namespace, deploymentName)
+		}
+
+		// 4. Forward the original request to backend (preserving multipart body)
+		defer func() {
+			if s.Registry != nil {
+				s.Registry.FinishRequest(namespace, deploymentName)
+			}
+		}()
 		s.forwardRawRequest(c, model, backendPath, startTime)
 	}
 }
@@ -677,4 +869,608 @@ func getNodeSelectorKey(nodeSelector map[string]string) string {
 		return k + "=" + v
 	}
 	return "default"
+}
+
+// deploymentMutex provides single-flight protection for deployment creation
+// to prevent duplicate deployments when multiple concurrent requests come in
+// for the same cold model.
+var deploymentMutex sync.Map
+
+// ensureDeployment ensures that a deployment exists and is ready for the given model.
+// It uses a single-flight pattern to prevent duplicate deployment creation.
+func (s *Server) ensureDeployment(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
+	logger := log.FromContext(ctx)
+	namespace := model.Namespace
+	name := model.Name
+	key := namespace + "/" + name
+
+	// Use single-flight pattern to prevent duplicate deployment creation
+	// LoadOrStore returns the existing mutex if another goroutine is already
+	// creating the deployment, or stores a new mutex if this is the first.
+	muRaw, _ := deploymentMutex.LoadOrStore(key, &sync.Mutex{})
+	mu := muRaw.(*sync.Mutex)
+	mu.Lock()
+	defer func() {
+		mu.Unlock()
+		// Clean up the mutex after we're done
+		deploymentMutex.Delete(key)
+	}()
+
+	// Double-check the registry state after acquiring the lock
+	entry := s.Registry.Get(namespace, name)
+	if entry != nil && entry.State == registry.StateReady {
+		logger.V(1).Info("Deployment already ready after acquiring lock")
+		return nil
+	}
+
+	// Check if we can allocate memory budget
+	if !s.Tracker.CanAllocate(name, namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
+		return fmt.Errorf("insufficient memory budget to create deployment")
+	}
+
+	// Get the InferenceBackend CRD
+	backend := &inferencev1alpha1.InferenceBackend{}
+	backendKey := client.ObjectKey{Name: model.Spec.Backend, Namespace: namespace}
+	if err := s.K8sClient.Get(ctx, backendKey, backend); err != nil {
+		return fmt.Errorf("failed to get InferenceBackend %s: %w", model.Spec.Backend, err)
+	}
+
+	// Set registry state to Creating before starting
+	s.Registry.SetState(namespace, name, registry.StateCreating)
+
+	// Build the deployment spec
+	deployment, err := s.buildDeploymentSpec(model, backend)
+	if err != nil {
+		s.Registry.SetState(namespace, name, registry.StateNonexistent)
+		return fmt.Errorf("failed to build deployment spec: %w", err)
+	}
+
+	// Set owner reference
+	if err := controllerutil.SetControllerReference(model, deployment, s.Scheme); err != nil {
+		s.Registry.SetState(namespace, name, registry.StateNonexistent)
+		return fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	// Create the deployment
+	if err := s.K8sClient.Create(ctx, deployment); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			s.Registry.SetState(namespace, name, registry.StateNonexistent)
+			return fmt.Errorf("failed to create deployment: %w", err)
+		}
+		logger.Info("Deployment already exists, proceeding")
+	}
+
+	// Build and create the Service
+	service := s.buildServiceSpec(model, backend)
+	if err := controllerutil.SetControllerReference(model, service, s.Scheme); err != nil {
+		logger.Error(err, "failed to set controller reference for service")
+	} else if err := s.K8sClient.Create(ctx, service); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			logger.Error(err, "failed to create service")
+		}
+	}
+
+	// Allocate memory budget
+	if !s.Tracker.Allocate(name, namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
+		logger.Error(nil, "failed to allocate memory after creating deployment")
+		// Try to clean up the deployment
+		_ = s.K8sClient.Delete(ctx, deployment)
+		s.Registry.SetState(namespace, name, registry.StateNonexistent)
+		return fmt.Errorf("failed to allocate memory budget")
+	}
+
+	logger.Info("Created deployment for on-demand model",
+		"namespace", namespace,
+		"model", name,
+		"memory", model.Spec.Resources.Memory,
+		"backend", model.Spec.Backend,
+	)
+
+	// Wait for deployment to become ready
+	if err := s.waitForDeploymentReady(ctx, model); err != nil {
+		return fmt.Errorf("deployment failed to become ready: %w", err)
+	}
+
+	return nil
+}
+
+// waitForDeploymentReady waits for the deployment to become ready with timeout.
+// It polls the deployment status until all replicas are ready or timeout is reached.
+func (s *Server) waitForDeploymentReady(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
+	logger := log.FromContext(ctx)
+	namespace := model.Namespace
+	name := model.Name
+
+	timeout := s.ScaleUpTimeout
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
+
+	timeoutChan := time.After(timeout)
+	ticker := time.NewTicker(s.ReadyCheckDelay)
+	if ticker == nil {
+		ticker = time.NewTicker(2 * time.Second)
+	}
+	defer ticker.Stop()
+
+	deploymentKey := types.NamespacedName{Name: name, Namespace: namespace}
+
+	for {
+		select {
+		case <-timeoutChan:
+			s.Registry.SetState(namespace, name, registry.StateNonexistent)
+			return fmt.Errorf("timeout waiting for deployment to become ready after %v", timeout)
+
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-ticker.C:
+			deployment := &appsv1.Deployment{}
+			if err := s.K8sClient.Get(ctx, deploymentKey, deployment); err != nil {
+				if errors.IsNotFound(err) {
+					logger.V(1).Info("Deployment not found yet, continuing to wait")
+					continue
+				}
+				logger.Error(err, "Failed to get deployment status during wait")
+				continue
+			}
+
+			// Check if deployment is ready
+			if deployment.Status.ReadyReplicas > 0 &&
+				deployment.Status.ReadyReplicas == deployment.Status.Replicas {
+				logger.Info("Deployment is now ready",
+					"namespace", namespace,
+					"model", name,
+					"ready_replicas", deployment.Status.ReadyReplicas,
+					"replicas", deployment.Status.Replicas,
+				)
+				s.Registry.SetState(namespace, name, registry.StateReady)
+				return nil
+			}
+
+			logger.V(1).Info("Waiting for deployment to become ready",
+				"namespace", namespace,
+				"model", name,
+				"ready_replicas", deployment.Status.ReadyReplicas,
+				"replicas", deployment.Status.Replicas,
+				"updated_replicas", deployment.Status.UpdatedReplicas,
+				"available_replicas", deployment.Status.AvailableReplicas,
+			)
+		}
+	}
+}
+
+// waitForDeploymentDeleted waits for the deployment to be deleted.
+func (s *Server) waitForDeploymentDeleted(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
+	logger := log.FromContext(ctx)
+	namespace := model.Namespace
+	name := model.Name
+
+	timeout := 30 * time.Second
+	timeoutChan := time.After(timeout)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	deploymentKey := types.NamespacedName{Name: name, Namespace: namespace}
+
+	for {
+		select {
+		case <-timeoutChan:
+			return fmt.Errorf("timeout waiting for deployment to be deleted")
+
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-ticker.C:
+			deployment := &appsv1.Deployment{}
+			if err := s.K8sClient.Get(ctx, deploymentKey, deployment); err != nil {
+				if errors.IsNotFound(err) {
+					logger.Info("Deployment has been deleted",
+						"namespace", namespace,
+						"model", name,
+					)
+					s.Registry.Delete(namespace, name)
+					return nil
+				}
+				logger.Error(err, "Failed to get deployment status during deletion wait")
+				continue
+			}
+		}
+	}
+}
+
+// buildDeploymentSpec creates a Deployment spec from an InferenceModel and InferenceBackend.
+// This reuses the logic from the controller.
+func (s *Server) buildDeploymentSpec(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (*appsv1.Deployment, error) {
+	labels := buildDeploymentLabels(model)
+	port := resolvePort(model, backend)
+	readinessPath, livenessPath := resolveProbePaths(model, backend)
+
+	envVars := buildContainerEnv(model, backend, port)
+	volumes, volumeMounts := buildVolumeConfig(model, backend)
+
+	// Add HF_SOURCE env var for HuggingFace models
+	if model.Spec.Source.HuggingFace != nil && model.Spec.Storage.PVC != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "HF_SOURCE",
+			Value: getModelDir(model),
+		})
+	}
+
+	paths := resolveSourcePaths(model)
+	args := buildContainerArgs(model, backend, paths)
+
+	container := s.buildMainContainer(model, backend, port, readinessPath, livenessPath, envVars, volumeMounts, args)
+	podSpec := buildPodSpec(model, backend, container, volumes)
+
+	replicas := model.Spec.Scaling.MaxReplicas
+	if replicas == 0 {
+		replicas = 1
+	}
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      model.Name,
+			Namespace: model.Namespace,
+			Labels:    labels,
+			Annotations: map[string]string{
+				"inference.eh-ops.io/memory":  model.Spec.Resources.Memory,
+				"inference.eh-ops.io/backend": model.Spec.Backend,
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app.kubernetes.io/name": model.Name},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+					Annotations: map[string]string{
+						"inference.eh-ops.io/last-request-time": time.Now().UTC().Format(time.RFC3339),
+					},
+				},
+				Spec: podSpec,
+			},
+		},
+	}
+
+	return deployment, nil
+}
+
+// buildServiceSpec creates a Service for the inference deployment.
+func (s *Server) buildServiceSpec(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) *corev1.Service {
+	port := resolvePort(model, backend)
+
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      model.Name,
+			Namespace: model.Namespace,
+			Labels:    buildDeploymentLabels(model),
+		},
+		Spec: corev1.ServiceSpec{
+			Type: model.Spec.Service.Type,
+			Selector: map[string]string{
+				"app.kubernetes.io/name": model.Name,
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "http",
+					Port:       port,
+					TargetPort: intstr.FromInt(int(port)),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
+// buildDeploymentLabels creates standard labels for the deployment and pods.
+func buildDeploymentLabels(model *inferencev1alpha1.InferenceModel) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":      model.Name,
+		"app.kubernetes.io/component": "inference-server",
+		"inference.eh-ops.io/model":   model.Spec.ModelName,
+		"inference.eh-ops.io/backend": model.Spec.Backend,
+		"inference.eh-ops.io/managed": "true",
+	}
+}
+
+// resolvePort determines the port to use from backend or model overrides.
+func resolvePort(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) int32 {
+	port := backend.Spec.Port
+	if port == 0 {
+		port = 8080
+	}
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Port != nil {
+		port = *model.Spec.BackendOverrides.Port
+	}
+	return port
+}
+
+// resolveImage determines the image to use from backend or model overrides.
+func resolveImage(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) string {
+	imageRef := &backend.Spec.Image
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Image != nil {
+		imageRef = model.Spec.BackendOverrides.Image
+	}
+	return imageRef.GetImage()
+}
+
+// resolveProbePaths determines readiness and liveness probe paths.
+func resolveProbePaths(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (readiness, liveness string) {
+	readiness = backend.Spec.ReadinessPath
+	if readiness == "" {
+		readiness = "/health"
+	}
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.ReadinessPath != nil {
+		readiness = *model.Spec.BackendOverrides.ReadinessPath
+	}
+
+	liveness = backend.Spec.LivenessPath
+	if liveness == "" {
+		liveness = readiness
+	}
+	return readiness, liveness
+}
+
+// buildContainerEnv builds environment variables for the container.
+func buildContainerEnv(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend, port int32) []corev1.EnvVar {
+	envVars := []corev1.EnvVar{
+		{Name: "MODEL_NAME", Value: model.Spec.ModelName},
+		{Name: "BACKEND_URL", Value: fmt.Sprintf("http://localhost:%d", port)},
+		{Name: "PORT", Value: fmt.Sprintf("%d", port)},
+	}
+	envVars = append(envVars, backend.Spec.Env...)
+	envVars = append(envVars, model.Spec.Env...)
+	return envVars
+}
+
+// buildVolumeConfig builds volumes and volume mounts for the pod.
+func buildVolumeConfig(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) ([]corev1.Volume, []corev1.VolumeMount) {
+	volumes := append([]corev1.Volume{}, backend.Spec.Volumes...)
+	volumeMounts := append([]corev1.VolumeMount{}, backend.Spec.VolumeMounts...)
+
+	if model.Spec.Source.HuggingFace != nil && model.Spec.Storage.PVC != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "model-cache",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: model.Spec.Storage.PVC,
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "model-cache",
+			MountPath: "/models",
+		})
+	}
+	return volumes, volumeMounts
+}
+
+// getModelDir returns the directory path for the model within the PVC.
+func getModelDir(model *inferencev1alpha1.InferenceModel) string {
+	modelDir := model.Spec.Storage.ModelDir
+	if modelDir == "" {
+		// Default to model name, replacing any slashes
+		modelDir = strings.ReplaceAll(model.Spec.ModelName, "/", "-")
+	}
+	return "/models/" + modelDir
+}
+
+// sourcePaths contains the resolved paths for model files.
+type sourcePaths struct {
+	hfSource     string
+	mmprojSource string
+}
+
+// resolveSourcePaths calculates HF_SOURCE and MMPROJ_SOURCE paths for arg substitution.
+func resolveSourcePaths(model *inferencev1alpha1.InferenceModel) sourcePaths {
+	var paths sourcePaths
+
+	if model.Spec.Source.HuggingFace != nil {
+		modelDir := getModelDir(model)
+		hf := model.Spec.Source.HuggingFace
+		if hf.ModelFile != "" {
+			paths.hfSource = fmt.Sprintf("%s/%s", modelDir, hf.ModelFile)
+		} else {
+			paths.hfSource = modelDir
+		}
+		if hf.MmprojFile != "" {
+			paths.mmprojSource = fmt.Sprintf("%s/%s", modelDir, hf.MmprojFile)
+		}
+	} else if model.Spec.Source.PVC != nil {
+		pvc := model.Spec.Source.PVC
+		if pvc.ModelFile != "" {
+			paths.hfSource = fmt.Sprintf("%s/%s", pvc.Path, pvc.ModelFile)
+		} else {
+			paths.hfSource = pvc.Path
+		}
+		if pvc.MmprojFile != "" {
+			paths.mmprojSource = fmt.Sprintf("%s/%s", pvc.Path, pvc.MmprojFile)
+		}
+	}
+	return paths
+}
+
+// buildContainerArgs builds args with variable substitution.
+func buildContainerArgs(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend, paths sourcePaths) []string {
+	args := append(backend.Spec.Args, model.Spec.Args...)
+	for i, arg := range args {
+		if paths.hfSource != "" {
+			args[i] = strings.ReplaceAll(arg, "$(HF_SOURCE)", paths.hfSource)
+		}
+		if paths.mmprojSource != "" {
+			args[i] = strings.ReplaceAll(arg, "$(MMPROJ_SOURCE)", paths.mmprojSource)
+		}
+	}
+	return args
+}
+
+// buildMainContainer creates the main inference container.
+func (s *Server) buildMainContainer(
+	model *inferencev1alpha1.InferenceModel,
+	backend *inferencev1alpha1.InferenceBackend,
+	port int32,
+	readinessPath, livenessPath string,
+	envVars []corev1.EnvVar,
+	volumeMounts []corev1.VolumeMount,
+	args []string,
+) corev1.Container {
+	container := corev1.Container{
+		Name:            "inference",
+		Image:           resolveImage(model, backend),
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Ports: []corev1.ContainerPort{
+			{Name: "http", ContainerPort: port, Protocol: corev1.ProtocolTCP},
+		},
+		Env:          envVars,
+		VolumeMounts: volumeMounts,
+		Resources:    s.buildResourceRequirements(model, backend),
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: readinessPath,
+					Port: intstr.FromInt(int(port)),
+				},
+			},
+			InitialDelaySeconds: 30, PeriodSeconds: 10, TimeoutSeconds: 5,
+			SuccessThreshold: 1, FailureThreshold: 3,
+		},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: livenessPath,
+					Port: intstr.FromInt(int(port)),
+				},
+			},
+			InitialDelaySeconds: 60, PeriodSeconds: 30, TimeoutSeconds: 5, FailureThreshold: 3,
+		},
+		Args: args,
+	}
+
+	if len(backend.Spec.Command) > 0 {
+		container.Command = backend.Spec.Command
+	}
+	if backend.Spec.SecurityContext != nil {
+		container.SecurityContext = backend.Spec.SecurityContext
+	}
+	return container
+}
+
+// buildPodSpec creates the pod spec for the deployment.
+func buildPodSpec(
+	model *inferencev1alpha1.InferenceModel,
+	backend *inferencev1alpha1.InferenceBackend,
+	container corev1.Container,
+	volumes []corev1.Volume,
+) corev1.PodSpec {
+	podSpec := corev1.PodSpec{
+		Containers:   []corev1.Container{container},
+		NodeSelector: model.Spec.NodeSelector,
+		Volumes:      volumes,
+	}
+
+	if len(model.Spec.Tolerations) > 0 {
+		podSpec.Tolerations = model.Spec.Tolerations
+	}
+	if model.Spec.Affinity != nil {
+		podSpec.Affinity = model.Spec.Affinity
+	}
+	if len(backend.Spec.InitContainers) > 0 {
+		podSpec.InitContainers = backend.Spec.InitContainers
+	}
+
+	// Add sidecar if specified
+	if model.Spec.Sidecar != nil {
+		sidecar := corev1.Container{
+			Name:  model.Spec.Sidecar.Name,
+			Image: model.Spec.Sidecar.Image,
+			Ports: model.Spec.Sidecar.Ports,
+			Args:  model.Spec.Sidecar.Args,
+			Env:   model.Spec.Sidecar.Env,
+		}
+		if model.Spec.Sidecar.Resources != nil {
+			sidecar.Resources = *model.Spec.Sidecar.Resources
+		}
+		if sidecar.Name == "" {
+			sidecar.Name = "sidecar"
+		}
+		podSpec.Containers = append(podSpec.Containers, sidecar)
+	}
+
+	// Add GPU tolerations if needed
+	gpuConfig := backend.Spec.GPU
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.GPU != nil {
+		gpuConfig = model.Spec.BackendOverrides.GPU
+	}
+	if gpuConfig != nil && (gpuConfig.Exclusive || gpuConfig.Shared) && len(podSpec.Tolerations) == 0 {
+		podSpec.Tolerations = []corev1.Toleration{
+			{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+		}
+	}
+
+	return podSpec
+}
+
+// buildResourceRequirements creates ResourceRequirements from the InferenceModel spec and InferenceBackend.
+func (s *Server) buildResourceRequirements(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) corev1.ResourceRequirements {
+	requirements := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{},
+		Limits:   corev1.ResourceList{},
+	}
+
+	// Set memory request from spec
+	if model.Spec.Resources.Memory != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.Memory); err == nil {
+			requirements.Requests[corev1.ResourceMemory] = q
+		}
+	}
+
+	// Set CPU request from spec
+	if model.Spec.Resources.CPU != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.CPU); err == nil {
+			requirements.Requests[corev1.ResourceCPU] = q
+		}
+	}
+
+	// Set memory limit (defaults to memory request if not specified)
+	if model.Spec.Resources.MemoryLimit != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.MemoryLimit); err == nil {
+			requirements.Limits[corev1.ResourceMemory] = q
+		}
+	} else if model.Spec.Resources.Memory != "" {
+		if q, err := resource.ParseQuantity(model.Spec.Resources.Memory); err == nil {
+			requirements.Limits[corev1.ResourceMemory] = q
+		}
+	}
+
+	// Set GPU resources from backend configuration (can be overridden by model)
+	gpuConfig := backend.Spec.GPU
+	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.GPU != nil {
+		gpuConfig = model.Spec.BackendOverrides.GPU
+	}
+
+	if gpuConfig != nil {
+		gpuResourceName := corev1.ResourceName("nvidia.com/gpu")
+		if gpuConfig.ResourceName != "" {
+			gpuResourceName = corev1.ResourceName(gpuConfig.ResourceName)
+		} else if gpuConfig.Shared {
+			gpuResourceName = corev1.ResourceName("amd.com/gpu-shared")
+		}
+
+		if gpuConfig.Exclusive || gpuConfig.Shared {
+			// Set GPU to 1 for both exclusive and shared modes
+			requirements.Requests[gpuResourceName] = resource.MustParse("1")
+			requirements.Limits[gpuResourceName] = resource.MustParse("1")
+		}
+	}
+
+	return requirements
+}
+
+// IsConditionTrue returns true if the condition with the given type is true.
+func IsConditionTrue(conditions []metav1.Condition, conditionType string) bool {
+	condition := meta.FindStatusCondition(conditions, conditionType)
+	return condition != nil && condition.Status == metav1.ConditionTrue
 }

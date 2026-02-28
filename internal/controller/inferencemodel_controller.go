@@ -42,6 +42,7 @@ import (
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/budget"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/registry"
 )
 
 const (
@@ -88,6 +89,7 @@ type InferenceModelReconciler struct {
 	Recorder record.EventRecorder
 	Tracker  *budget.Tracker
 	Metrics  *metrics.Collector
+	Registry *registry.DeploymentRegistry
 }
 
 //+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencemodels,verbs=get;list;watch;create;update;patch;delete
@@ -248,6 +250,9 @@ func (r *InferenceModelReconciler) handleDeletion(ctx context.Context, model *in
 
 	// Clean up metrics
 	r.Metrics.DeleteModelMetrics(model.Name, model.Namespace)
+
+	// Remove from registry
+	r.Registry.Delete(model.Namespace, model.Name)
 
 	// Clean up model files from shared/existing PVC if needed
 	if r.needsModelCleanup(model) {
@@ -1070,6 +1075,9 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 	r.Recorder.Event(model, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created deployment %s", deployment.Name))
 
+	// Update registry to indicate deployment is creating
+	r.Registry.SetState(model.Namespace, model.Name, registry.StateCreating)
+
 	// Update status to indicate deployment is in progress
 	if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,
 		ReasonDeploying, "Deployment created, waiting for pods to become ready"); err != nil {
@@ -1490,9 +1498,9 @@ func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Skip if already scaled to zero and scaling is enabled
+	// If deployment doesn't exist or has 0 replicas, nothing to do for idle scaling
 	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
-		logger.V(1).Info("Model is already scaled to zero")
+		logger.V(1).Info("Model deployment has 0 replicas, skipping idle deletion check")
 		return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
 	}
 
@@ -1533,11 +1541,11 @@ func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model 
 	// Calculate idle time
 	idleTime := time.Since(lastRequest)
 
-	// Scale to zero if idle time exceeds cooldown period
+	// Delete deployment if idle time exceeds cooldown period
 	if idleTime > cooldownPeriod {
-		logger.Info("Model idle time exceeded cooldown period, scaling to zero",
+		logger.Info("Model idle time exceeded cooldown period, deleting deployment",
 			"model", model.Name, "idleTime", idleTime, "cooldownPeriod", cooldownPeriod)
-		return r.scaleToZero(ctx, model, deployment)
+		return r.deleteIdleDeployment(ctx, model, deployment)
 	}
 
 	// Requeue when we should check again
@@ -1568,31 +1576,58 @@ func (r *InferenceModelReconciler) updateLastRequestAnnotation(ctx context.Conte
 	return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
 }
 
-// scaleToZero scales the deployment to 0 replicas
-func (r *InferenceModelReconciler) scaleToZero(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
+// deleteIdleDeployment deletes the deployment and associated service when the model is idle
+func (r *InferenceModelReconciler) deleteIdleDeployment(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Scale to zero
-	deploymentCopy := deployment.DeepCopy()
-	zero := int32(0)
-	deploymentCopy.Spec.Replicas = &zero
-
-	if err := r.Update(ctx, deploymentCopy); err != nil {
-		logger.Error(err, "failed to scale deployment to zero")
-		return ctrl.Result{}, fmt.Errorf("failed to scale deployment to zero: %w", err)
+	// Check if there are any active requests in the registry (best-effort check)
+	if r.Registry != nil {
+		entry := r.Registry.Get(model.Namespace, model.Name)
+		if entry != nil && entry.ActiveRequests > 0 {
+			logger.Info("Model has active requests, skipping deletion",
+				"model", model.Name, "activeRequests", entry.ActiveRequests)
+			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+		}
 	}
 
-	logger.Info("Scaled deployment to zero replicas", "model", model.Name)
-	r.Recorder.Event(model, corev1.EventTypeNormal, "ScaledToZero",
-		"Scaled deployment to 0 replicas due to inactivity")
+	// Delete the associated Service first
+	service := &corev1.Service{}
+	serviceKey := client.ObjectKey{Name: deployment.Name, Namespace: deployment.Namespace}
+	if err := r.Get(ctx, serviceKey, service); err == nil {
+		// Service exists, delete it
+		if err := r.Delete(ctx, service); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "failed to delete service", "service", deployment.Name)
+			// Continue with deployment deletion even if service deletion fails
+		} else {
+			logger.Info("Deleted service for idle model", "service", deployment.Name, "model", model.Name)
+		}
+	} else if !errors.IsNotFound(err) {
+		logger.Error(err, "failed to check for service before deletion")
+	}
+
+	// Delete the deployment
+	if err := r.Delete(ctx, deployment); err != nil {
+		logger.Error(err, "failed to delete deployment for idle model")
+		return ctrl.Result{}, fmt.Errorf("failed to delete deployment for idle model: %w", err)
+	}
+
+	logger.Info("Deleted deployment for idle model", "model", model.Name, "deployment", deployment.Name)
+	r.Recorder.Event(model, corev1.EventTypeNormal, "DeploymentDeleted",
+		fmt.Sprintf("Deleted deployment %s due to inactivity", deployment.Name))
+
+	// Remove from registry
+	if r.Registry != nil {
+		r.Registry.Delete(model.Namespace, model.Name)
+		logger.Info("Removed model from registry", "model", model.Name)
+	}
 
 	// Update status
 	if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,
-		ReasonScaledToZero, "Model scaled to zero due to inactivity"); err != nil {
+		ReasonScaledToZero, "Model deployment deleted due to inactivity"); err != nil {
 		logger.Error(err, "failed to update status condition")
 	}
 
-	// Release memory budget when scaled to zero
+	// Release memory budget
 	r.Tracker.ReleaseModel(model.Name, model.Namespace)
 
 	return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
@@ -1750,6 +1785,8 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 	if deployment.Status.ReadyReplicas > 0 && deployment.Status.UnavailableReplicas == 0 {
 		setConditionOnModel(&model.Status, ConditionTypeAvailable, metav1.ConditionTrue,
 			ReasonDeployed, "Model is available and serving requests")
+		// Update registry to indicate deployment is ready
+		r.Registry.SetState(model.Namespace, model.Name, registry.StateReady)
 	} else {
 		setConditionOnModel(&model.Status, ConditionTypeAvailable, metav1.ConditionFalse,
 			reason, message)

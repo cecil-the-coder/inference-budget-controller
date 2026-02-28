@@ -32,6 +32,7 @@ import (
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/budget"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/registry"
 )
 
 // IdleTracker tracks idle time for models
@@ -88,6 +89,7 @@ type Server struct {
 	K8sClient   client.Client
 	Scheme      *runtime.Scheme
 	Metrics     *metrics.Collector
+	Registry    *registry.DeploymentRegistry
 
 	// Configuration
 	Namespace       string // Default namespace to look for InferenceModels
@@ -126,6 +128,13 @@ func WithReadyCheckDelay(delay time.Duration) ServerOption {
 func WithMetrics(collector *metrics.Collector) ServerOption {
 	return func(s *Server) {
 		s.Metrics = collector
+	}
+}
+
+// WithRegistry sets the deployment registry
+func WithRegistry(reg *registry.DeploymentRegistry) ServerOption {
+	return func(s *Server) {
+		s.Registry = reg
 	}
 }
 

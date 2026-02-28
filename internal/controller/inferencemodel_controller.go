@@ -1038,6 +1038,18 @@ func (r *InferenceModelReconciler) createDeployment(ctx context.Context, model *
 		return ctrl.Result{}, fmt.Errorf("failed to create deployment: %w", err)
 	}
 
+	// Create the service for the deployment
+	service := r.buildService(model, backend)
+	if err := controllerutil.SetControllerReference(model, service, r.Scheme); err != nil {
+		logger.Error(err, "failed to set controller reference for service")
+	} else if err := r.Create(ctx, service); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			logger.Error(err, "failed to create service")
+			r.Recorder.Event(model, corev1.EventTypeWarning, "FailedCreate",
+				fmt.Sprintf("Failed to create service: %v", err))
+		}
+	}
+
 	// Allocate memory budget
 	if !r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
 		// This shouldn't happen since we checked with CanAllocate, but handle it
@@ -1361,6 +1373,32 @@ func (r *InferenceModelReconciler) buildDeployment(model *inferencev1alpha1.Infe
 	}
 
 	return deployment, nil
+}
+
+// buildService creates a Service for the inference deployment
+func (r *InferenceModelReconciler) buildService(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) *corev1.Service {
+	port := resolvePort(model, backend)
+
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      model.Name,
+			Namespace: model.Namespace,
+			Labels:    buildDeploymentLabels(model),
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app.kubernetes.io/name": model.Name,
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "http",
+					Port:       port,
+					TargetPort: intstr.FromInt(int(port)),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
 }
 
 // buildResourceRequirements creates ResourceRequirements from the InferenceModel spec and InferenceBackend

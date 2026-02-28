@@ -192,7 +192,15 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// The proxy will create the deployment when a request comes in
 			r.Registry.SetState(model.Namespace, model.Name, registry.StateNonexistent)
 
-			// Update status to indicate waiting
+			// Update status to reflect no deployment exists
+			model.Status.Ready = false
+			model.Status.Replicas = 0
+			model.Status.AvailableReplicas = 0
+			if err := r.Status().Update(ctx, model); err != nil {
+				logger.Error(err, "failed to update status for nonexistent deployment")
+			}
+
+			// Update condition to indicate waiting
 			if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,
 				ReasonDeploying, "Waiting for first request to create deployment"); err != nil {
 				logger.Error(err, "failed to update status condition")

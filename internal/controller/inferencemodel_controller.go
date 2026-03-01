@@ -972,7 +972,8 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 	fmt.Fprintf(&cmd, "mkdir -p %s && ", modelDir)
 
 	// Build hf download command
-	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s", modelDir)
+	// Use --force-download to re-download even if files exist (handles corrupted files)
+	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s --force-download", modelDir)
 
 	// Add revision if specified
 	if hf.Revision != "" {

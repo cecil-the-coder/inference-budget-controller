@@ -964,8 +964,8 @@ func getModelDir(model *inferencev1alpha1.InferenceModel) string {
 func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.HuggingFaceSource, modelDir string) string {
 	var cmd strings.Builder
 
-	// Install dependencies
-	cmd.WriteString("pip install huggingface_hub[cli] hf-transfer && ")
+	// Install dependencies (include requests for API verification)
+	cmd.WriteString("pip install huggingface_hub[cli] hf-transfer requests && ")
 	cmd.WriteString("export HF_HUB_ENABLE_HF_TRANSFER=1 && ")
 
 	// Create model directory
@@ -989,6 +989,27 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 			cmd.WriteString(file)
 		}
 	}
+
+	// Verify file integrity using HuggingFace API checksums
+	// This fetches the expected SHA256 hashes from the HF API and compares them
+	cmd.WriteString(" && python3 -c \"")
+	cmd.WriteString("import os, hashlib, requests, json, sys; ")
+	cmd.WriteString("repo=os.environ.get('HF_REPO',''); ")
+	cmd.WriteString("rev='")
+	if hf.Revision != "" {
+		cmd.WriteString(hf.Revision)
+	} else {
+		cmd.WriteString("main")
+	}
+	cmd.WriteString("'; ")
+	cmd.WriteString("api_url=f'https://huggingface.co/api/models/{repo}/tree/{rev}'; ")
+	cmd.WriteString("r=requests.get(api_url, timeout=30); r.raise_for_status(); ")
+	cmd.WriteString("files={f['path']:f['sha256'] for f in r.json() if 'sha256' in f}; ")
+	cmd.WriteString("base='")
+	cmd.WriteString(modelDir)
+	cmd.WriteString("'; ")
+	cmd.WriteString("[sys.exit(1) for f,expected in files.items() if os.path.exists(base+'/'+f) and hashlib.sha256(open(base+'/'+f,'rb').read()).hexdigest() != expected]; ")
+	cmd.WriteString("print(f'Verified {len(files)} files against HuggingFace checksums')\"")
 
 	// Validate GGUF files by checking magic bytes before marking as ready
 	// GGUF files start with "GGUF" magic bytes (0x47475546)

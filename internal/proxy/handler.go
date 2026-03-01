@@ -1457,6 +1457,18 @@ func (s *Server) buildMainContainer(
 		Env:          envVars,
 		VolumeMounts: volumeMounts,
 		Resources:    s.buildResourceRequirements(model, backend),
+		// Startup probe allows slow-starting containers without long initial delays
+		// It checks every second for up to 120 seconds (120 attempts)
+		StartupProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: readinessPath,
+					Port: intstr.FromInt(int(port)),
+				},
+			},
+			InitialDelaySeconds: 1, PeriodSeconds: 1, TimeoutSeconds: 5,
+			FailureThreshold: 120, // 1s + 120*1s = 121s max startup time
+		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
@@ -1464,7 +1476,8 @@ func (s *Server) buildMainContainer(
 					Port: intstr.FromInt(int(port)),
 				},
 			},
-			InitialDelaySeconds: 30, PeriodSeconds: 10, TimeoutSeconds: 5,
+			InitialDelaySeconds: 0, // StartupProbe handles initial delay
+			PeriodSeconds: 10, TimeoutSeconds: 5,
 			SuccessThreshold: 1, FailureThreshold: 3,
 		},
 		LivenessProbe: &corev1.Probe{
@@ -1474,7 +1487,8 @@ func (s *Server) buildMainContainer(
 					Port: intstr.FromInt(int(port)),
 				},
 			},
-			InitialDelaySeconds: 60, PeriodSeconds: 30, TimeoutSeconds: 5, FailureThreshold: 3,
+			InitialDelaySeconds: 0, // StartupProbe handles initial delay
+			PeriodSeconds: 30, TimeoutSeconds: 5, FailureThreshold: 3,
 		},
 		Args: args,
 	}

@@ -129,6 +129,13 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 
 		// 2. Check registry for deployment state and ensure deployment exists
 		if s.Registry != nil {
+			// IMPORTANT: Record request BEFORE ensuring deployment to prevent
+			// the controller from deleting the deployment while we wait for it
+			// to become ready. This increments ActiveRequests, which the controller
+			// checks before deleting idle deployments.
+			s.Registry.RecordRequest(namespace, modelName)
+			requestRecorded := true
+
 			entry := s.Registry.Get(namespace, modelName)
 			var state registry.DeploymentState
 			if entry == nil {
@@ -147,6 +154,9 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
 					logger.Error(err, "Failed to ensure deployment")
+					// Decrement since we won't proceed to forward
+					s.Registry.FinishRequest(namespace, modelName)
+					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to create deployment: " + err.Error(),
@@ -166,6 +176,9 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 
 				if err := s.waitForDeploymentReady(ctx, model); err != nil {
 					logger.Error(err, "Timed out waiting for deployment to become ready")
+					// Decrement since we won't proceed to forward
+					s.Registry.FinishRequest(namespace, modelName)
+					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Deployment is taking too long to become ready: " + err.Error(),
@@ -196,6 +209,9 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
 					logger.Error(err, "Failed to recreate deployment")
+					// Decrement since we won't proceed to forward
+					s.Registry.FinishRequest(namespace, modelName)
+					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to recreate deployment: " + err.Error(),
@@ -206,6 +222,9 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 					return
 				}
 			}
+
+			// Don't call RecordRequest again at line 243-246 since we already did
+			_ = requestRecorded // used for tracking
 		} else {
 			// Fallback to legacy behavior when registry is not available
 			if !model.Status.Ready {
@@ -240,12 +259,8 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 			}
 		}
 
-		// 3. Record request in registry before forwarding
-		if s.Registry != nil {
-			s.Registry.RecordRequest(namespace, modelName)
-		}
-
-		// 4. Forward request to backend (with defer to finish request tracking)
+		// 3. Forward request to backend (with defer to finish request tracking)
+		// Note: RecordRequest was already called earlier if Registry is available
 		defer func() {
 			if s.Registry != nil {
 				s.Registry.FinishRequest(namespace, modelName)
@@ -316,6 +331,13 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 
 		// 2. Check registry for deployment state and ensure deployment exists
 		if s.Registry != nil {
+			// IMPORTANT: Record request BEFORE ensuring deployment to prevent
+			// the controller from deleting the deployment while we wait for it
+			// to become ready. This increments ActiveRequests, which the controller
+			// checks before deleting idle deployments.
+			s.Registry.RecordRequest(namespace, deploymentName)
+			requestRecorded := true
+
 			entry := s.Registry.Get(namespace, deploymentName)
 			var state registry.DeploymentState
 			if entry == nil {
@@ -334,6 +356,9 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
 					logger.Error(err, "Failed to ensure deployment")
+					// Decrement since we won't proceed to forward
+					s.Registry.FinishRequest(namespace, deploymentName)
+					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to create deployment: " + err.Error(),
@@ -353,6 +378,9 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 
 				if err := s.waitForDeploymentReady(ctx, model); err != nil {
 					logger.Error(err, "Timed out waiting for deployment to become ready")
+					// Decrement since we won't proceed to forward
+					s.Registry.FinishRequest(namespace, deploymentName)
+					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Deployment is taking too long to become ready: " + err.Error(),
@@ -383,6 +411,9 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
 					logger.Error(err, "Failed to recreate deployment")
+					// Decrement since we won't proceed to forward
+					s.Registry.FinishRequest(namespace, deploymentName)
+					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to recreate deployment: " + err.Error(),
@@ -393,6 +424,8 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 					return
 				}
 			}
+
+			_ = requestRecorded // used for tracking
 		} else {
 			// Fallback to legacy behavior when registry is not available
 			if !model.Status.Ready {
@@ -427,12 +460,8 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 			}
 		}
 
-		// 3. Record request in registry before forwarding
-		if s.Registry != nil {
-			s.Registry.RecordRequest(namespace, deploymentName)
-		}
-
-		// 4. Forward the original request to backend (preserving multipart body)
+		// 3. Forward the original request to backend (preserving multipart body)
+		// Note: RecordRequest was already called earlier if Registry is available
 		defer func() {
 			if s.Registry != nil {
 				s.Registry.FinishRequest(namespace, deploymentName)

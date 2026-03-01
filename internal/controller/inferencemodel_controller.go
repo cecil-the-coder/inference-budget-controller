@@ -975,6 +975,9 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 	// Create model directory
 	fmt.Fprintf(&cmd, "mkdir -p %s && ", modelDir)
 
+	// Disable hf-transfer for more reliable downloads (it can cause corruption with parallel downloads)
+	cmd.WriteString("unset HF_HUB_ENABLE_HF_TRANSFER && ")
+
 	// Build hf download command
 	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s", modelDir)
 

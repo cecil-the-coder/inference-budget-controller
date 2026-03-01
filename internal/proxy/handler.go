@@ -478,7 +478,24 @@ func (s *Server) forwardRawRequest(c *gin.Context, model *inferencev1alpha1.Infe
 	ctx := c.Request.Context()
 	logger := log.FromContext(ctx)
 
-	backendURL := s.getBackendURL(model)
+	// Try to get pod IP directly to bypass service iptables rules
+	port := int32(8080)
+	if model.Spec.Service.Port != nil {
+		port = *model.Spec.Service.Port
+	}
+
+	podIP, err := s.getBackendPodIP(ctx, model)
+	var backendURL string
+	if err != nil {
+		logger.V(1).Info("Could not get pod IP, falling back to service DNS",
+			"model", model.Name,
+			"namespace", model.Namespace,
+			"error", err.Error(),
+		)
+		backendURL = s.getBackendURL(model)
+	} else {
+		backendURL = fmt.Sprintf("http://%s:%d", podIP, port)
+	}
 
 	backendReq, err := http.NewRequestWithContext(ctx, c.Request.Method, backendURL+backendPath, c.Request.Body)
 	if err != nil {
@@ -731,13 +748,53 @@ func (s *Server) getBackendURL(model *inferencev1alpha1.InferenceModel) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d", model.Name, model.Namespace, port)
 }
 
+// getBackendPodIP gets the pod IP for the first ready pod backing a model's service
+func (s *Server) getBackendPodIP(ctx context.Context, model *inferencev1alpha1.InferenceModel) (string, error) {
+	// Get endpoints for the service
+	endpoints := &corev1.Endpoints{}
+	endpointsKey := types.NamespacedName{Name: model.Name, Namespace: model.Namespace}
+	if err := s.K8sClient.Get(ctx, endpointsKey, endpoints); err != nil {
+		return "", fmt.Errorf("failed to get endpoints: %w", err)
+	}
+
+	for _, subset := range endpoints.Subsets {
+		if len(subset.Addresses) > 0 {
+			return subset.Addresses[0].IP, nil
+		}
+	}
+
+	return "", fmt.Errorf("no ready endpoints found")
+}
+
 // forwardToBackend forwards a request to the given backend path
 func (s *Server) forwardToBackend(c *gin.Context, model *inferencev1alpha1.InferenceModel, bodyBytes []byte, req *inferenceRequest, backendPath string, startTime time.Time) {
 	ctx := c.Request.Context()
 	logger := log.FromContext(ctx)
 
-	// Construct backend URL from model's service
-	backendURL := s.getBackendURL(model)
+	// Try to get pod IP directly to bypass service iptables rules
+	// This helps avoid "operation not permitted" errors when connecting to newly created services
+	port := int32(8080)
+	if model.Spec.Service.Port != nil {
+		port = *model.Spec.Service.Port
+	}
+
+	podIP, err := s.getBackendPodIP(ctx, model)
+	var backendURL string
+	if err != nil {
+		logger.V(1).Info("Could not get pod IP, falling back to service DNS",
+			"model", model.Name,
+			"namespace", model.Namespace,
+			"error", err.Error(),
+		)
+		backendURL = s.getBackendURL(model)
+	} else {
+		backendURL = fmt.Sprintf("http://%s:%d", podIP, port)
+		logger.V(1).Info("Using direct pod IP for backend connection",
+			"model", model.Name,
+			"namespace", model.Namespace,
+			"pod_ip", podIP,
+		)
+	}
 
 	// Create request to backend
 	backendReq, err := http.NewRequestWithContext(ctx, "POST", backendURL+backendPath, bytes.NewReader(bodyBytes))

@@ -964,8 +964,8 @@ func getModelDir(model *inferencev1alpha1.InferenceModel) string {
 func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.HuggingFaceSource, modelDir string) string {
 	var cmd strings.Builder
 
-	// Install dependencies (include requests for API verification)
-	cmd.WriteString("pip install huggingface_hub[cli] hf-transfer requests && ")
+	// Install dependencies (include hf-xet for Xet storage support, requests for API verification)
+	cmd.WriteString("pip install huggingface_hub[cli] hf-transfer hf-xet requests && ")
 	cmd.WriteString("export HF_HUB_ENABLE_HF_TRANSFER=1 && ")
 
 	// Remove existing model directory AND any HuggingFace cache to ensure clean re-download
@@ -974,12 +974,6 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 
 	// Create model directory
 	fmt.Fprintf(&cmd, "mkdir -p %s && ", modelDir)
-
-	// Explicitly disable HuggingFace caching to force fresh download
-	cmd.WriteString("export HF_HUB_CACHE=/dev/null && ")
-
-	// Disable hf-transfer for more reliable downloads (it can cause corruption with parallel downloads)
-	cmd.WriteString("unset HF_HUB_ENABLE_HF_TRANSFER && ")
 
 	// Build hf download command
 	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s", modelDir)

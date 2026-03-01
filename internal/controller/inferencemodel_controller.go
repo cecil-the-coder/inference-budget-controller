@@ -133,22 +133,23 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Handle retry annotation for failed downloads
+	// Handle retry annotation for failed or completed downloads
 	if _, retryRequested := model.Annotations[RetryDownloadAnnotation]; retryRequested {
-		if model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseFailed {
-			logger.Info("Retry annotation detected for failed download, clearing and retrying", "model", model.Name)
+		if model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseFailed ||
+			model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseComplete {
+			logger.Info("Retry annotation detected, clearing and re-downloading", "model", model.Name, "currentPhase", model.Status.DownloadPhase)
 
-			// Delete the failed download job if it exists
+			// Delete the existing download job if it exists
 			jobName := getDownloadJobName(model)
 			job := &batchv1.Job{}
 			err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: model.Namespace}, job)
 			if err == nil {
 				// Job exists, delete it with background propagation so we can recreate it
 				if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-					logger.Error(err, "failed to delete failed download job for retry")
-					return ctrl.Result{}, fmt.Errorf("failed to delete failed download job: %w", err)
+					logger.Error(err, "failed to delete download job for retry")
+					return ctrl.Result{}, fmt.Errorf("failed to delete download job: %w", err)
 				}
-				logger.Info("Deleted failed download job for retry", "model", model.Name, "job", jobName)
+				logger.Info("Deleted download job for retry", "model", model.Name, "job", jobName)
 			} else if !errors.IsNotFound(err) {
 				logger.Error(err, "failed to fetch download job for retry")
 				return ctrl.Result{}, fmt.Errorf("failed to fetch download job: %w", err)

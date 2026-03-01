@@ -35,7 +35,6 @@ import (
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/registry"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -147,41 +146,41 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 			switch state {
 			case registry.StateNonexistent:
 				// Deployment doesn't exist, need to create it
-				logger.Info("Deployment nonexistent, creating on-demand",
+				logger.Info("Pod nonexistent, creating on-demand",
 					"namespace", namespace,
 					"model", modelName,
 				)
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
-					logger.Error(err, "Failed to ensure deployment")
+					logger.Error(err, "Failed to ensure pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, modelName)
 					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
-							Message: "Failed to create deployment: " + err.Error(),
+							Message: "Failed to create pod: " + err.Error(),
 							Type:    "server_error",
-							Code:    "deployment_failed",
+							Code:    "pod_failed",
 						},
 					})
 					return
 				}
 
 			case registry.StateCreating:
-				// Deployment is being created, wait for it to be ready
-				logger.Info("Deployment creating, waiting for ready state",
+				// Pod is being created, wait for it to be ready
+				logger.Info("Pod creating, waiting for ready state",
 					"namespace", namespace,
 					"model", modelName,
 				)
 
-				if err := s.waitForDeploymentReady(ctx, model); err != nil {
-					logger.Error(err, "Timed out waiting for deployment to become ready")
+				if err := s.waitForPodReady(ctx, model); err != nil {
+					logger.Error(err, "Timed out waiting for pod to become ready")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, modelName)
 					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
-							Message: "Deployment is taking too long to become ready: " + err.Error(),
+							Message: "Pod is taking too long to become ready: " + err.Error(),
 							Type:    "server_error",
 							Code:    "deployment_timeout",
 						},
@@ -190,33 +189,33 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 				}
 
 			case registry.StateReady:
-				// Deployment is ready, proceed
-				logger.V(1).Info("Deployment already ready",
+				// Pod is ready, proceed
+				logger.V(1).Info("Pod already ready",
 					"namespace", namespace,
 					"model", modelName,
 				)
 
 			case registry.StateDeleting:
-				// Deployment is being deleted, wait and recreate
-				logger.Info("Deployment is being deleted, waiting and recreating",
+				// Pod is being deleted, wait and recreate
+				logger.Info("Pod is being deleted, waiting and recreating",
 					"namespace", namespace,
 					"model", modelName,
 				)
 
-				if err := s.waitForDeploymentDeleted(ctx, model); err != nil {
+				if err := s.waitForPodDeleted(ctx, model); err != nil {
 					logger.Error(err, "Failed waiting for deployment deletion")
 				}
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
-					logger.Error(err, "Failed to recreate deployment")
+					logger.Error(err, "Failed to recreate pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, modelName)
 					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
-							Message: "Failed to recreate deployment: " + err.Error(),
+							Message: "Failed to recreate pod: " + err.Error(),
 							Type:    "server_error",
-							Code:    "deployment_failed",
+							Code:    "pod_failed",
 						},
 					})
 					return
@@ -349,41 +348,41 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 			switch state {
 			case registry.StateNonexistent:
 				// Deployment doesn't exist, need to create it
-				logger.Info("Deployment nonexistent, creating on-demand",
+				logger.Info("Pod nonexistent, creating on-demand",
 					"namespace", namespace,
 					"model", deploymentName,
 				)
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
-					logger.Error(err, "Failed to ensure deployment")
+					logger.Error(err, "Failed to ensure pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, deploymentName)
 					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
-							Message: "Failed to create deployment: " + err.Error(),
+							Message: "Failed to create pod: " + err.Error(),
 							Type:    "server_error",
-							Code:    "deployment_failed",
+							Code:    "pod_failed",
 						},
 					})
 					return
 				}
 
 			case registry.StateCreating:
-				// Deployment is being created, wait for it to be ready
-				logger.Info("Deployment creating, waiting for ready state",
+				// Pod is being created, wait for it to be ready
+				logger.Info("Pod creating, waiting for ready state",
 					"namespace", namespace,
 					"model", deploymentName,
 				)
 
-				if err := s.waitForDeploymentReady(ctx, model); err != nil {
-					logger.Error(err, "Timed out waiting for deployment to become ready")
+				if err := s.waitForPodReady(ctx, model); err != nil {
+					logger.Error(err, "Timed out waiting for pod to become ready")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, deploymentName)
 					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
-							Message: "Deployment is taking too long to become ready: " + err.Error(),
+							Message: "Pod is taking too long to become ready: " + err.Error(),
 							Type:    "server_error",
 							Code:    "deployment_timeout",
 						},
@@ -392,33 +391,33 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 				}
 
 			case registry.StateReady:
-				// Deployment is ready, proceed
-				logger.V(1).Info("Deployment already ready",
+				// Pod is ready, proceed
+				logger.V(1).Info("Pod already ready",
 					"namespace", namespace,
 					"model", deploymentName,
 				)
 
 			case registry.StateDeleting:
-				// Deployment is being deleted, wait and recreate
-				logger.Info("Deployment is being deleted, waiting and recreating",
+				// Pod is being deleted, wait and recreate
+				logger.Info("Pod is being deleted, waiting and recreating",
 					"namespace", namespace,
 					"model", deploymentName,
 				)
 
-				if err := s.waitForDeploymentDeleted(ctx, model); err != nil {
+				if err := s.waitForPodDeleted(ctx, model); err != nil {
 					logger.Error(err, "Failed waiting for deployment deletion")
 				}
 
 				if err := s.ensureDeployment(ctx, model); err != nil {
-					logger.Error(err, "Failed to recreate deployment")
+					logger.Error(err, "Failed to recreate pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, deploymentName)
 					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
-							Message: "Failed to recreate deployment: " + err.Error(),
+							Message: "Failed to recreate pod: " + err.Error(),
 							Type:    "server_error",
-							Code:    "deployment_failed",
+							Code:    "pod_failed",
 						},
 					})
 					return
@@ -644,7 +643,7 @@ func (s *Server) handleInsufficientMemory(c *gin.Context, model *inferencev1alph
 	})
 }
 
-// triggerScaleUp triggers the scale-up of a model by updating its deployment
+// triggerScaleUp triggers the creation of a pod for the model (legacy fallback)
 func (s *Server) triggerScaleUp(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
 	logger := log.FromContext(ctx)
 
@@ -658,39 +657,31 @@ func (s *Server) triggerScaleUp(ctx context.Context, model *inferencev1alpha1.In
 		s.Metrics.RecordAdmission(model.Name, model.Namespace, metrics.AdmissionAccepted)
 	}
 
-	// Check if deployment exists
-	deployment := &appsv1.Deployment{}
-	deploymentKey := client.ObjectKey{Name: model.Name, Namespace: model.Namespace}
+	// Check if pod exists
+	pod := &corev1.Pod{}
+	podKey := client.ObjectKey{Name: model.Name, Namespace: model.Namespace}
 
-	err := s.K8sClient.Get(ctx, deploymentKey, deployment)
+	err := s.K8sClient.Get(ctx, podKey, pod)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Deployment doesn't exist, we need to create it
-			// This would typically be handled by the controller, but we can signal it
-			logger.Info("Deployment not found, controller should create it",
-				"deployment", model.Name,
+			// Pod doesn't exist, use ensureDeployment to create it
+			logger.Info("Pod not found, creating via ensureDeployment",
+				"pod", model.Name,
 				"namespace", model.Namespace,
 				"memory_declared", model.Spec.Resources.Memory,
 				"node", getNodeSelectorKey(model.Spec.NodeSelector),
 			)
-			return nil
+			return s.ensureDeployment(ctx, model)
 		}
-		return fmt.Errorf("failed to get deployment: %w", err)
+		return fmt.Errorf("failed to get pod: %w", err)
 	}
 
-	// If deployment exists but is scaled to zero, scale it up
-	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
-		replicas := int32(1)
-		deployment.Spec.Replicas = &replicas
-		if err := s.K8sClient.Update(ctx, deployment); err != nil {
-			return fmt.Errorf("failed to scale up deployment: %w", err)
-		}
-		logger.Info("Triggered scale-up for deployment",
-			"deployment", model.Name,
-			"namespace", model.Namespace,
-			"memory_declared", model.Spec.Resources.Memory,
-		)
-	}
+	// Pod exists, nothing to do
+	logger.Info("Pod already exists",
+		"pod", model.Name,
+		"namespace", model.Namespace,
+		"phase", pod.Status.Phase,
+	)
 
 	return nil
 }
@@ -748,22 +739,19 @@ func (s *Server) getBackendURL(model *inferencev1alpha1.InferenceModel) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d", model.Name, model.Namespace, port)
 }
 
-// getBackendPodIP gets the pod IP for the first ready pod backing a model's service
+// getBackendPodIP gets the pod IP directly from the pod
 func (s *Server) getBackendPodIP(ctx context.Context, model *inferencev1alpha1.InferenceModel) (string, error) {
-	// Get endpoints for the service
-	endpoints := &corev1.Endpoints{}
-	endpointsKey := types.NamespacedName{Name: model.Name, Namespace: model.Namespace}
-	if err := s.K8sClient.Get(ctx, endpointsKey, endpoints); err != nil {
-		return "", fmt.Errorf("failed to get endpoints: %w", err)
+	pod := &corev1.Pod{}
+	podKey := types.NamespacedName{Name: model.Name, Namespace: model.Namespace}
+	if err := s.K8sClient.Get(ctx, podKey, pod); err != nil {
+		return "", fmt.Errorf("failed to get pod: %w", err)
 	}
 
-	for _, subset := range endpoints.Subsets {
-		if len(subset.Addresses) > 0 {
-			return subset.Addresses[0].IP, nil
-		}
+	if pod.Status.PodIP == "" {
+		return "", fmt.Errorf("pod has no IP yet")
 	}
 
-	return "", fmt.Errorf("no ready endpoints found")
+	return pod.Status.PodIP, nil
 }
 
 // forwardToBackend forwards a request to the given backend path
@@ -962,17 +950,17 @@ func getNodeSelectorKey(nodeSelector map[string]string) string {
 // for the same cold model.
 var deploymentMutex sync.Map
 
-// ensureDeployment ensures that a deployment exists and is ready for the given model.
-// It uses a single-flight pattern to prevent duplicate deployment creation.
+// ensureDeployment ensures that a pod exists and is ready for the given model.
+// It uses a single-flight pattern to prevent duplicate pod creation.
 func (s *Server) ensureDeployment(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
 	logger := log.FromContext(ctx)
 	namespace := model.Namespace
 	name := model.Name
 	key := namespace + "/" + name
 
-	// Use single-flight pattern to prevent duplicate deployment creation
+	// Use single-flight pattern to prevent duplicate pod creation
 	// LoadOrStore returns the existing mutex if another goroutine is already
-	// creating the deployment, or stores a new mutex if this is the first.
+	// creating the pod, or stores a new mutex if this is the first.
 	muRaw, _ := deploymentMutex.LoadOrStore(key, &sync.Mutex{})
 	mu := muRaw.(*sync.Mutex)
 	mu.Lock()
@@ -985,13 +973,13 @@ func (s *Server) ensureDeployment(ctx context.Context, model *inferencev1alpha1.
 	// Double-check the registry state after acquiring the lock
 	entry := s.Registry.Get(namespace, name)
 	if entry != nil && entry.State == registry.StateReady {
-		logger.V(1).Info("Deployment already ready after acquiring lock")
+		logger.V(1).Info("Pod already ready after acquiring lock")
 		return nil
 	}
 
 	// Check if we can allocate memory budget
 	if !s.Tracker.CanAllocate(name, namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
-		return fmt.Errorf("insufficient memory budget to create deployment")
+		return fmt.Errorf("insufficient memory budget to create pod")
 	}
 
 	// Get the InferenceBackend CRD
@@ -1004,66 +992,55 @@ func (s *Server) ensureDeployment(ctx context.Context, model *inferencev1alpha1.
 	// Set registry state to Creating before starting
 	s.Registry.SetState(namespace, name, registry.StateCreating)
 
-	// Build the deployment spec
-	deployment, err := s.buildDeploymentSpec(model, backend)
+	// Build the pod spec (standalone pod, not deployment)
+	pod, err := s.buildPod(model, backend)
 	if err != nil {
 		s.Registry.SetState(namespace, name, registry.StateNonexistent)
-		return fmt.Errorf("failed to build deployment spec: %w", err)
+		return fmt.Errorf("failed to build pod spec: %w", err)
 	}
 
 	// Set owner reference
-	if err := controllerutil.SetControllerReference(model, deployment, s.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(model, pod, s.Scheme); err != nil {
 		s.Registry.SetState(namespace, name, registry.StateNonexistent)
 		return fmt.Errorf("failed to set controller reference: %w", err)
 	}
 
-	// Create the deployment
-	if err := s.K8sClient.Create(ctx, deployment); err != nil {
+	// Create the pod
+	if err := s.K8sClient.Create(ctx, pod); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			s.Registry.SetState(namespace, name, registry.StateNonexistent)
-			return fmt.Errorf("failed to create deployment: %w", err)
+			return fmt.Errorf("failed to create pod: %w", err)
 		}
-		logger.Info("Deployment already exists, proceeding")
-	}
-
-	// Build and create the Service
-	service := s.buildServiceSpec(model, backend)
-	if err := controllerutil.SetControllerReference(model, service, s.Scheme); err != nil {
-		logger.Error(err, "failed to set controller reference for service")
-	} else if err := s.K8sClient.Create(ctx, service); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "failed to create service")
-		}
+		logger.Info("Pod already exists, proceeding")
 	}
 
 	// Allocate memory budget
 	if !s.Tracker.Allocate(name, namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
-		logger.Error(nil, "failed to allocate memory after creating deployment")
-		// Try to clean up the deployment
-		_ = s.K8sClient.Delete(ctx, deployment)
+		logger.Error(nil, "failed to allocate memory after creating pod")
+		// Try to clean up the pod
+		_ = s.K8sClient.Delete(ctx, pod)
 		s.Registry.SetState(namespace, name, registry.StateNonexistent)
 		return fmt.Errorf("failed to allocate memory budget")
 	}
 
-	logger.Info("Created deployment for on-demand model",
+	logger.Info("Created pod for on-demand model",
 		"namespace", namespace,
 		"model", name,
 		"memory", model.Spec.Resources.Memory,
 		"backend", model.Spec.Backend,
 	)
 
-	// Wait for deployment to become ready
-	if err := s.waitForDeploymentReady(ctx, model); err != nil {
-		return fmt.Errorf("deployment failed to become ready: %w", err)
+	// Wait for pod to become ready
+	if err := s.waitForPodReady(ctx, model); err != nil {
+		return fmt.Errorf("pod failed to become ready: %w", err)
 	}
 
 	return nil
 }
 
-// waitForDeploymentReady waits for the deployment to become ready with timeout.
-// It polls the deployment status until all replicas are ready AND service endpoints
-// are populated, or timeout is reached.
-func (s *Server) waitForDeploymentReady(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
+// waitForPodReady waits for the pod to become ready with timeout.
+// It polls the pod status until it's ready, or timeout is reached.
+func (s *Server) waitForPodReady(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
 	logger := log.FromContext(ctx)
 	namespace := model.Namespace
 	name := model.Name
@@ -1076,102 +1053,57 @@ func (s *Server) waitForDeploymentReady(ctx context.Context, model *inferencev1a
 	timeoutChan := time.After(timeout)
 	ticker := time.NewTicker(s.ReadyCheckDelay)
 	if ticker == nil {
-		ticker = time.NewTicker(2 * time.Second)
+		ticker = time.NewTicker(1 * time.Second)
 	}
 	defer ticker.Stop()
 
-	deploymentKey := types.NamespacedName{Name: name, Namespace: namespace}
+	podKey := types.NamespacedName{Name: name, Namespace: namespace}
 
 	for {
 		select {
 		case <-timeoutChan:
 			s.Registry.SetState(namespace, name, registry.StateNonexistent)
-			return fmt.Errorf("timeout waiting for deployment to become ready after %v", timeout)
+			return fmt.Errorf("timeout waiting for pod to become ready after %v", timeout)
 
 		case <-ctx.Done():
 			return ctx.Err()
 
 		case <-ticker.C:
-			deployment := &appsv1.Deployment{}
-			if err := s.K8sClient.Get(ctx, deploymentKey, deployment); err != nil {
+			pod := &corev1.Pod{}
+			if err := s.K8sClient.Get(ctx, podKey, pod); err != nil {
 				if errors.IsNotFound(err) {
-					logger.V(1).Info("Deployment not found yet, continuing to wait")
+					logger.V(1).Info("Pod not found yet, continuing to wait")
 					continue
 				}
-				logger.Error(err, "Failed to get deployment status during wait")
+				logger.Error(err, "Failed to get pod status during wait")
 				continue
 			}
 
-			// Check if deployment is ready
-			if deployment.Status.ReadyReplicas > 0 &&
-				deployment.Status.ReadyReplicas == deployment.Status.Replicas {
-
-				// Also verify service endpoints are ready
-				endpointsReady, err := s.checkServiceEndpointsReady(ctx, namespace, name)
-				if err != nil {
-					logger.V(1).Info("Service endpoints not ready yet, continuing to wait",
+			// Check if pod is ready
+			for _, condition := range pod.Status.Conditions {
+				if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+					logger.Info("Pod is now ready",
 						"namespace", namespace,
 						"model", name,
-						"error", err.Error(),
+						"pod_ip", pod.Status.PodIP,
 					)
-					continue
+					s.Registry.SetState(namespace, name, registry.StateReady)
+					return nil
 				}
-
-				if !endpointsReady {
-					logger.V(1).Info("Deployment ready but service endpoints not populated yet",
-						"namespace", namespace,
-						"model", name,
-					)
-					continue
-				}
-
-				logger.Info("Deployment is now ready",
-					"namespace", namespace,
-					"model", name,
-					"ready_replicas", deployment.Status.ReadyReplicas,
-					"replicas", deployment.Status.Replicas,
-				)
-				s.Registry.SetState(namespace, name, registry.StateReady)
-				return nil
 			}
 
-			logger.V(1).Info("Waiting for deployment to become ready",
+			logger.V(1).Info("Waiting for pod to become ready",
 				"namespace", namespace,
 				"model", name,
-				"ready_replicas", deployment.Status.ReadyReplicas,
-				"replicas", deployment.Status.Replicas,
-				"updated_replicas", deployment.Status.UpdatedReplicas,
-				"available_replicas", deployment.Status.AvailableReplicas,
+				"phase", pod.Status.Phase,
+				"pod_ip", pod.Status.PodIP,
 			)
 		}
 	}
 }
 
-// checkServiceEndpointsReady checks if the service has ready endpoints.
-// This ensures kube-proxy has programmed the necessary networking rules.
-func (s *Server) checkServiceEndpointsReady(ctx context.Context, namespace, name string) (bool, error) {
-	// Check Endpoints resource (older API but widely supported)
-	endpoints := &corev1.Endpoints{}
-	endpointsKey := types.NamespacedName{Name: name, Namespace: namespace}
-	if err := s.K8sClient.Get(ctx, endpointsKey, endpoints); err != nil {
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-
-	// Check if any subset has at least one ready address
-	for _, subset := range endpoints.Subsets {
-		if len(subset.Addresses) > 0 {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-// waitForDeploymentDeleted waits for the deployment to be deleted.
-func (s *Server) waitForDeploymentDeleted(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
+// waitForPodDeleted waits for the pod to be deleted.
+func (s *Server) waitForPodDeleted(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
 	logger := log.FromContext(ctx)
 	namespace := model.Namespace
 	name := model.Name
@@ -1181,37 +1113,38 @@ func (s *Server) waitForDeploymentDeleted(ctx context.Context, model *inferencev
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	deploymentKey := types.NamespacedName{Name: name, Namespace: namespace}
+	podKey := types.NamespacedName{Name: name, Namespace: namespace}
 
 	for {
 		select {
 		case <-timeoutChan:
-			return fmt.Errorf("timeout waiting for deployment to be deleted")
+			return fmt.Errorf("timeout waiting for pod to be deleted")
 
 		case <-ctx.Done():
 			return ctx.Err()
 
 		case <-ticker.C:
-			deployment := &appsv1.Deployment{}
-			if err := s.K8sClient.Get(ctx, deploymentKey, deployment); err != nil {
+			pod := &corev1.Pod{}
+			if err := s.K8sClient.Get(ctx, podKey, pod); err != nil {
 				if errors.IsNotFound(err) {
-					logger.Info("Deployment has been deleted",
+					logger.Info("Pod has been deleted",
 						"namespace", namespace,
 						"model", name,
 					)
 					s.Registry.Delete(namespace, name)
 					return nil
 				}
-				logger.Error(err, "Failed to get deployment status during deletion wait")
+				logger.Error(err, "Failed to get pod status during deletion wait")
 				continue
 			}
 		}
 	}
 }
 
-// buildDeploymentSpec creates a Deployment spec from an InferenceModel and InferenceBackend.
-// This reuses the logic from the controller.
-func (s *Server) buildDeploymentSpec(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (*appsv1.Deployment, error) {
+// buildPod creates a standalone Pod from an InferenceModel and InferenceBackend.
+// Using a Pod directly instead of a Deployment is faster for serverless scale-from-zero
+// since it eliminates the Deployment controller reconciliation loop.
+func (s *Server) buildPod(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) (*corev1.Pod, error) {
 	labels := buildDeploymentLabels(model)
 	port := resolvePort(model, backend)
 	readinessPath, livenessPath := resolveProbePaths(model, backend)
@@ -1233,69 +1166,24 @@ func (s *Server) buildDeploymentSpec(model *inferencev1alpha1.InferenceModel, ba
 	container := s.buildMainContainer(model, backend, port, readinessPath, livenessPath, envVars, volumeMounts, args)
 	podSpec := buildPodSpec(model, backend, container, volumes)
 
-	replicas := model.Spec.Scaling.MaxReplicas
-	if replicas == 0 {
-		replicas = 1
-	}
-
-	deployment := &appsv1.Deployment{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      model.Name,
 			Namespace: model.Namespace,
 			Labels:    labels,
 			Annotations: map[string]string{
-				"inference.eh-ops.io/memory":  model.Spec.Resources.Memory,
-				"inference.eh-ops.io/backend": model.Spec.Backend,
+				"inference.eh-ops.io/memory":         model.Spec.Resources.Memory,
+				"inference.eh-ops.io/backend":        model.Spec.Backend,
+				"inference.eh-ops.io/last-request-time": time.Now().UTC().Format(time.RFC3339),
 			},
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app.kubernetes.io/name": model.Name},
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-					Annotations: map[string]string{
-						"inference.eh-ops.io/last-request-time": time.Now().UTC().Format(time.RFC3339),
-					},
-				},
-				Spec: podSpec,
-			},
-		},
+		Spec: podSpec,
 	}
 
-	return deployment, nil
+	return pod, nil
 }
 
-// buildServiceSpec creates a Service for the inference deployment.
-func (s *Server) buildServiceSpec(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) *corev1.Service {
-	port := resolvePort(model, backend)
-
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      model.Name,
-			Namespace: model.Namespace,
-			Labels:    buildDeploymentLabels(model),
-		},
-		Spec: corev1.ServiceSpec{
-			Type: model.Spec.Service.Type,
-			Selector: map[string]string{
-				"app.kubernetes.io/name": model.Name,
-			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "http",
-					Port:       port,
-					TargetPort: intstr.FromInt(int(port)),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
-		},
-	}
-}
-
-// buildDeploymentLabels creates standard labels for the deployment and pods.
+// buildDeploymentLabels creates standard labels for the pod.
 func buildDeploymentLabels(model *inferencev1alpha1.InferenceModel) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":      model.Name,

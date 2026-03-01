@@ -1004,7 +1004,8 @@ func (s *Server) ensureDeployment(ctx context.Context, model *inferencev1alpha1.
 }
 
 // waitForDeploymentReady waits for the deployment to become ready with timeout.
-// It polls the deployment status until all replicas are ready or timeout is reached.
+// It polls the deployment status until all replicas are ready AND service endpoints
+// are populated, or timeout is reached.
 func (s *Server) waitForDeploymentReady(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
 	logger := log.FromContext(ctx)
 	namespace := model.Namespace
@@ -1047,6 +1048,26 @@ func (s *Server) waitForDeploymentReady(ctx context.Context, model *inferencev1a
 			// Check if deployment is ready
 			if deployment.Status.ReadyReplicas > 0 &&
 				deployment.Status.ReadyReplicas == deployment.Status.Replicas {
+
+				// Also verify service endpoints are ready
+				endpointsReady, err := s.checkServiceEndpointsReady(ctx, namespace, name)
+				if err != nil {
+					logger.V(1).Info("Service endpoints not ready yet, continuing to wait",
+						"namespace", namespace,
+						"model", name,
+						"error", err.Error(),
+					)
+					continue
+				}
+
+				if !endpointsReady {
+					logger.V(1).Info("Deployment ready but service endpoints not populated yet",
+						"namespace", namespace,
+						"model", name,
+					)
+					continue
+				}
+
 				logger.Info("Deployment is now ready",
 					"namespace", namespace,
 					"model", name,
@@ -1067,6 +1088,29 @@ func (s *Server) waitForDeploymentReady(ctx context.Context, model *inferencev1a
 			)
 		}
 	}
+}
+
+// checkServiceEndpointsReady checks if the service has ready endpoints.
+// This ensures kube-proxy has programmed the necessary networking rules.
+func (s *Server) checkServiceEndpointsReady(ctx context.Context, namespace, name string) (bool, error) {
+	// Check Endpoints resource (older API but widely supported)
+	endpoints := &corev1.Endpoints{}
+	endpointsKey := types.NamespacedName{Name: name, Namespace: namespace}
+	if err := s.K8sClient.Get(ctx, endpointsKey, endpoints); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	// Check if any subset has at least one ready address
+	for _, subset := range endpoints.Subsets {
+		if len(subset.Addresses) > 0 {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // waitForDeploymentDeleted waits for the deployment to be deleted.

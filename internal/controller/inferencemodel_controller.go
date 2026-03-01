@@ -968,12 +968,15 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 	cmd.WriteString("pip install huggingface_hub[cli] hf-transfer requests && ")
 	cmd.WriteString("export HF_HUB_ENABLE_HF_TRANSFER=1 && ")
 
-	// Remove existing model directory to ensure clean re-download
-	// This is needed because --force-download alone doesn't always replace corrupted files
-	fmt.Fprintf(&cmd, "rm -rf %s && ", modelDir)
+	// Remove existing model directory AND any HuggingFace cache to ensure clean re-download
+	// The ~/.cache/huggingface directory can contain corrupted cached downloads
+	fmt.Fprintf(&cmd, "rm -rf %s && rm -rf /root/.cache/huggingface && ", modelDir)
 
 	// Create model directory
 	fmt.Fprintf(&cmd, "mkdir -p %s && ", modelDir)
+
+	// Explicitly disable HuggingFace caching to force fresh download
+	cmd.WriteString("export HF_HUB_CACHE=/dev/null && ")
 
 	// Disable hf-transfer for more reliable downloads (it can cause corruption with parallel downloads)
 	cmd.WriteString("unset HF_HUB_ENABLE_HF_TRANSFER && ")

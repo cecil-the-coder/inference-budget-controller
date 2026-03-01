@@ -989,6 +989,16 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 		}
 	}
 
+	// Validate GGUF files by checking magic bytes before marking as ready
+	// GGUF files start with "GGUF" magic bytes (0x47475546)
+	cmd.WriteString(" && ")
+	cmd.WriteString("for f in $(find ")
+	cmd.WriteString(modelDir)
+	cmd.WriteString(" -name '*.gguf' -type f); do ")
+	cmd.WriteString("if [ $(head -c 4 \"$f\" 2>/dev/null) != 'GGUF' ]; then ")
+	cmd.WriteString("echo \"ERROR: Invalid GGUF file: $f (corrupted or incomplete)\" >&2 && exit 1; ")
+	cmd.WriteString("fi; done")
+
 	// Create .ready file when complete
 	fmt.Fprintf(&cmd, " && touch %s/.ready", modelDir)
 

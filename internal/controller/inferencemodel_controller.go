@@ -968,12 +968,15 @@ func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.Hu
 	cmd.WriteString("pip install huggingface_hub[cli] hf-transfer requests && ")
 	cmd.WriteString("export HF_HUB_ENABLE_HF_TRANSFER=1 && ")
 
+	// Remove existing model directory to ensure clean re-download
+	// This is needed because --force-download alone doesn't always replace corrupted files
+	fmt.Fprintf(&cmd, "rm -rf %s && ", modelDir)
+
 	// Create model directory
 	fmt.Fprintf(&cmd, "mkdir -p %s && ", modelDir)
 
 	// Build hf download command
-	// Use --force-download to re-download even if files exist (handles corrupted files)
-	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s --force-download", modelDir)
+	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s", modelDir)
 
 	// Add revision if specified
 	if hf.Revision != "" {

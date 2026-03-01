@@ -22,7 +22,6 @@ import (
 	"strings"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -181,55 +180,47 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.handleDownload(ctx, model)
 	}
 
-	// Check if deployment exists
-	deployment := &appsv1.Deployment{}
-	deploymentName := req.Name
-	deploymentKey := client.ObjectKey{Name: deploymentName, Namespace: req.Namespace}
+	// Check if pod exists
+	pod := &corev1.Pod{}
+	podKey := client.ObjectKey{Name: req.Name, Namespace: req.Namespace}
 
-	err := r.Get(ctx, deploymentKey, deployment)
+	err := r.Get(ctx, podKey, pod)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Deployment doesn't exist - set registry state and wait for on-demand creation
-			// The proxy will create the deployment when a request comes in
+			// Pod doesn't exist - set registry state and wait for on-demand creation
+			// The proxy will create the pod when a request comes in
 			r.Registry.SetState(model.Namespace, model.Name, registry.StateNonexistent)
 
-			// Update status to reflect no deployment exists
+			// Update status to reflect no pod exists
 			model.Status.Ready = false
 			model.Status.Replicas = 0
 			model.Status.AvailableReplicas = 0
 			if err := r.Status().Update(ctx, model); err != nil {
-				logger.Error(err, "failed to update status for nonexistent deployment")
+				logger.Error(err, "failed to update status for nonexistent pod")
 			}
 
 			// Update condition to indicate waiting
 			if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,
-				ReasonDeploying, "Waiting for first request to create deployment"); err != nil {
+				ReasonDeploying, "Waiting for first request to create pod"); err != nil {
 				logger.Error(err, "failed to update status condition")
 			}
 
 			// Requeue periodically to check for changes
 			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
 		}
-		logger.Error(err, "unable to fetch Deployment")
+		logger.Error(err, "unable to fetch Pod")
 		return ctrl.Result{}, err
 	}
 
 	// Check for scale-to-zero based on idle time
-	if result, err := r.handleIdleScaling(ctx, model, deployment); err != nil {
+	if result, err := r.handleIdleScaling(ctx, model, pod); err != nil {
 		return result, err
 	} else if result.Requeue || result.RequeueAfter > 0 {
 		return result, nil
 	}
 
-	// Check if deployment needs to be updated
-	if result, err := r.handleUpdate(ctx, model, deployment); err != nil {
-		return result, err
-	} else if result.Requeue || result.RequeueAfter > 0 {
-		return result, nil
-	}
-
-	// Update status based on deployment state
-	return r.updateStatus(ctx, model, deployment)
+	// Update status based on pod state
+	return r.updateStatus(ctx, model, pod)
 }
 
 // needsDownload returns true if the model needs to be downloaded from HuggingFace
@@ -1092,50 +1083,24 @@ func (r *InferenceModelReconciler) buildResourceRequirements(model *inferencev1a
 }
 
 // handleIdleScaling checks if the model should be scaled to zero due to inactivity
-func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
+func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model *inferencev1alpha1.InferenceModel, pod *corev1.Pod) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Check if scaling is disabled
-	scalingDisabled := model.Spec.Scaling.Enabled != nil && !*model.Spec.Scaling.Enabled
-
-	// If scaling is disabled but deployment is at 0 replicas, scale it up
-	if scalingDisabled && deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
-		// Check if we can allocate memory budget before scaling up
-		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
-			logger.Error(fmt.Errorf("insufficient memory budget"), "Cannot scale up deployment, insufficient memory budget",
-				"model", model.Name, "namespace", model.Namespace)
-			r.Recorder.Event(model, corev1.EventTypeWarning, "ScaleUpFailed", "Insufficient memory budget to scale up deployment")
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
-
-		// Allocate memory budget
-		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
-
-		logger.Info("Scaling is disabled, scaling deployment up to 1 replica")
-		replicas := int32(1)
-		deployment.Spec.Replicas = &replicas
-		if err := r.Update(ctx, deployment); err != nil {
-			logger.Error(err, "Failed to scale deployment up")
-			// Release the allocated budget if the update fails
-			r.Tracker.ReleaseModel(model.Name, model.Namespace)
-			return ctrl.Result{}, err
-		}
-		r.Recorder.Event(model, corev1.EventTypeNormal, "ScaledUp", "Scaled deployment to 1 replica (scaling disabled)")
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// If deployment doesn't exist or has 0 replicas, nothing to do for idle scaling
-	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
-		logger.V(1).Info("Model deployment has 0 replicas, skipping idle deletion check")
-		return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
-	}
-
 	// If scaling is disabled, don't do idle scaling
+	scalingDisabled := model.Spec.Scaling.Enabled != nil && !*model.Spec.Scaling.Enabled
 	if scalingDisabled {
 		return ctrl.Result{}, nil
 	}
 
-	// Get cooldown period (default to 10 minutes)
+	// Check if there are active requests (from registry)
+	entry := r.Registry.Get(model.Namespace, model.Name)
+	if entry != nil && entry.ActiveRequests > 0 {
+		logger.V(1).Info("Model has active requests, skipping idle check",
+			"model", model.Name, "active_requests", entry.ActiveRequests)
+		return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+	}
+
+	// Get cooldown period (default to 5 minutes)
 	var cooldownPeriod time.Duration
 	if model.Spec.Scaling.ScaleToZeroDelay != "" {
 		if d, err := time.ParseDuration(model.Spec.Scaling.ScaleToZeroDelay); err == nil {
@@ -1148,30 +1113,30 @@ func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model 
 		}
 	}
 	if cooldownPeriod == 0 {
-		cooldownPeriod = 10 * time.Minute
+		cooldownPeriod = 5 * time.Minute
 	}
 
 	// Check last request time from annotation
-	lastRequestStr := deployment.Spec.Template.Annotations[LastRequestAnnotation]
+	lastRequestStr := pod.Annotations[LastRequestAnnotation]
 	if lastRequestStr == "" {
 		// No annotation yet, set it and continue
-		return r.updateLastRequestAnnotation(ctx, deployment)
+		return r.updateLastRequestAnnotation(ctx, pod)
 	}
 
 	lastRequest, err := time.Parse(time.RFC3339, lastRequestStr)
 	if err != nil {
 		logger.Error(err, "failed to parse last request time, resetting")
-		return r.updateLastRequestAnnotation(ctx, deployment)
+		return r.updateLastRequestAnnotation(ctx, pod)
 	}
 
 	// Calculate idle time
 	idleTime := time.Since(lastRequest)
 
-	// Delete deployment if idle time exceeds cooldown period
+	// Delete pod if idle time exceeds cooldown period
 	if idleTime > cooldownPeriod {
-		logger.Info("Model idle time exceeded cooldown period, deleting deployment",
+		logger.Info("Model idle time exceeded cooldown period, deleting pod",
 			"model", model.Name, "idleTime", idleTime, "cooldownPeriod", cooldownPeriod)
-		return r.deleteIdleDeployment(ctx, model, deployment)
+		return r.deleteIdlePod(ctx, model, pod)
 	}
 
 	// Requeue when we should check again
@@ -1187,23 +1152,23 @@ func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model 
 	return ctrl.Result{RequeueAfter: nextCheck}, nil
 }
 
-// updateLastRequestAnnotation updates the last request annotation on the deployment
-func (r *InferenceModelReconciler) updateLastRequestAnnotation(ctx context.Context, deployment *appsv1.Deployment) (ctrl.Result, error) {
-	deploymentCopy := deployment.DeepCopy()
-	if deploymentCopy.Spec.Template.Annotations == nil {
-		deploymentCopy.Spec.Template.Annotations = make(map[string]string)
+// updateLastRequestAnnotation updates the last request annotation on the pod
+func (r *InferenceModelReconciler) updateLastRequestAnnotation(ctx context.Context, pod *corev1.Pod) (ctrl.Result, error) {
+	podCopy := pod.DeepCopy()
+	if podCopy.Annotations == nil {
+		podCopy.Annotations = make(map[string]string)
 	}
-	deploymentCopy.Spec.Template.Annotations[LastRequestAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	podCopy.Annotations[LastRequestAnnotation] = time.Now().UTC().Format(time.RFC3339)
 
-	if err := r.Update(ctx, deploymentCopy); err != nil {
+	if err := r.Update(ctx, podCopy); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update last request annotation: %w", err)
 	}
 
 	return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
 }
 
-// deleteIdleDeployment deletes the deployment and associated service when the model is idle
-func (r *InferenceModelReconciler) deleteIdleDeployment(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
+// deleteIdlePod deletes the pod when the model is idle
+func (r *InferenceModelReconciler) deleteIdlePod(ctx context.Context, model *inferencev1alpha1.InferenceModel, pod *corev1.Pod) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Check if there are any active requests in the registry (best-effort check)
@@ -1216,30 +1181,15 @@ func (r *InferenceModelReconciler) deleteIdleDeployment(ctx context.Context, mod
 		}
 	}
 
-	// Delete the associated Service first
-	service := &corev1.Service{}
-	serviceKey := client.ObjectKey{Name: deployment.Name, Namespace: deployment.Namespace}
-	if err := r.Get(ctx, serviceKey, service); err == nil {
-		// Service exists, delete it
-		if err := r.Delete(ctx, service); err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "failed to delete service", "service", deployment.Name)
-			// Continue with deployment deletion even if service deletion fails
-		} else {
-			logger.Info("Deleted service for idle model", "service", deployment.Name, "model", model.Name)
-		}
-	} else if !errors.IsNotFound(err) {
-		logger.Error(err, "failed to check for service before deletion")
+	// Delete the pod
+	if err := r.Delete(ctx, pod); err != nil {
+		logger.Error(err, "failed to delete pod for idle model")
+		return ctrl.Result{}, fmt.Errorf("failed to delete pod for idle model: %w", err)
 	}
 
-	// Delete the deployment
-	if err := r.Delete(ctx, deployment); err != nil {
-		logger.Error(err, "failed to delete deployment for idle model")
-		return ctrl.Result{}, fmt.Errorf("failed to delete deployment for idle model: %w", err)
-	}
-
-	logger.Info("Deleted deployment for idle model", "model", model.Name, "deployment", deployment.Name)
-	r.Recorder.Event(model, corev1.EventTypeNormal, "DeploymentDeleted",
-		fmt.Sprintf("Deleted deployment %s due to inactivity", deployment.Name))
+	logger.Info("Deleted pod for idle model", "model", model.Name, "pod", pod.Name)
+	r.Recorder.Event(model, corev1.EventTypeNormal, "PodDeleted",
+		fmt.Sprintf("Deleted pod %s due to inactivity", pod.Name))
 
 	// Remove from registry
 	if r.Registry != nil {
@@ -1249,7 +1199,7 @@ func (r *InferenceModelReconciler) deleteIdleDeployment(ctx context.Context, mod
 
 	// Update status
 	if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,
-		ReasonScaledToZero, "Model deployment deleted due to inactivity"); err != nil {
+		ReasonScaledToZero, "Model pod deleted due to inactivity"); err != nil {
 		logger.Error(err, "failed to update status condition")
 	}
 
@@ -1259,114 +1209,46 @@ func (r *InferenceModelReconciler) deleteIdleDeployment(ctx context.Context, mod
 	return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
 }
 
-// handleUpdate checks if the deployment needs to be updated based on spec changes
-func (r *InferenceModelReconciler) handleUpdate(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
+// handleUpdate checks if the pod needs to be updated based on spec changes
+// For on-demand pods, we simply delete and recreate when specs change
+func (r *InferenceModelReconciler) handleUpdate(ctx context.Context, model *inferencev1alpha1.InferenceModel, pod *corev1.Pod) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the InferenceBackend to get current configuration
-	backend := &inferencev1alpha1.InferenceBackend{}
-	backendKey := client.ObjectKey{Name: model.Spec.Backend, Namespace: model.Namespace}
-	if err := r.Get(ctx, backendKey, backend); err != nil {
-		if errors.IsNotFound(err) {
-			logger.Error(err, "InferenceBackend not found", "backend", model.Spec.Backend)
-			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
-		}
-		logger.Error(err, "failed to fetch InferenceBackend")
-		return ctrl.Result{}, fmt.Errorf("failed to fetch InferenceBackend: %w", err)
+	// For on-demand pods, we don't update in place - we delete and let the proxy recreate
+	// Check if memory annotation changed
+	if pod.Annotations["inference.eh-ops.io/memory"] != model.Spec.Resources.Memory {
+		logger.Info("Pod memory annotation changed, will be updated on next creation")
 	}
-
-	needsUpdate := false
-	deploymentCopy := deployment.DeepCopy()
 
 	// Check if node selector changed
-	if !mapsEqual(deployment.Spec.Template.Spec.NodeSelector, model.Spec.NodeSelector) {
-		logger.Info("Node selector changed, updating deployment")
-		deploymentCopy.Spec.Template.Spec.NodeSelector = model.Spec.NodeSelector
-
-		// Re-allocate memory budget for new node selector
-		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
-			logger.Info("Insufficient memory budget for new node selector")
-			r.Recorder.Event(model, corev1.EventTypeWarning, "InsufficientMemory",
-				"Cannot update node selector: insufficient memory budget on target node pool")
-			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
-		}
-
-		// Release old allocation and create new one
-		r.Tracker.ReleaseModel(model.Name, model.Namespace)
-		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
-		needsUpdate = true
+	if !mapsEqual(pod.Spec.NodeSelector, model.Spec.NodeSelector) {
+		logger.Info("Node selector changed, pod will use new selector on next creation")
 	}
 
-	// Check if memory annotation changed
-	if deployment.Annotations["inference.eh-ops.io/memory"] != model.Spec.Resources.Memory {
-		if deploymentCopy.Annotations == nil {
-			deploymentCopy.Annotations = make(map[string]string)
-		}
-		deploymentCopy.Annotations["inference.eh-ops.io/memory"] = model.Spec.Resources.Memory
-		needsUpdate = true
-	}
-
-	// Note: Replicas are not automatically restored from zero here.
-	// Scale-up is handled by UpdateLastRequestTime when a request comes in via the proxy,
-	// or by a change in the InferenceModel spec that triggers a reconciliation.
-
-	// Check if resources changed
-	if len(deployment.Spec.Template.Spec.Containers) > 0 {
-		currentResources := deployment.Spec.Template.Spec.Containers[0].Resources
-		desiredResources := r.buildResourceRequirements(model, backend)
-
-		if !resourceListsEqual(currentResources.Requests, desiredResources.Requests) ||
-			!resourceListsEqual(currentResources.Limits, desiredResources.Limits) {
-			logger.Info("Resources changed, updating deployment")
-			deploymentCopy.Spec.Template.Spec.Containers[0].Resources = desiredResources
-			needsUpdate = true
-		}
-	}
-
-	// Check if container image changed (from backend or override)
-	if len(deployment.Spec.Template.Spec.Containers) > 0 {
-		imageRef := &backend.Spec.Image
-		if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.Image != nil {
-			imageRef = model.Spec.BackendOverrides.Image
-		}
-		desiredImage := imageRef.GetImage()
-		if deployment.Spec.Template.Spec.Containers[0].Image != desiredImage {
-			logger.Info("Container image changed, updating deployment",
-				"old", deployment.Spec.Template.Spec.Containers[0].Image,
-				"new", desiredImage)
-			deploymentCopy.Spec.Template.Spec.Containers[0].Image = desiredImage
-			needsUpdate = true
-		}
-	}
-
-	if needsUpdate {
-		if err := r.Update(ctx, deploymentCopy); err != nil {
-			logger.Error(err, "failed to update deployment")
-			return ctrl.Result{}, fmt.Errorf("failed to update deployment: %w", err)
-		}
-
-		logger.Info("Updated deployment for InferenceModel", "model", model.Name)
-		r.Recorder.Event(model, corev1.EventTypeNormal, "Updated",
-			fmt.Sprintf("Updated deployment %s", deployment.Name))
-
-		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
-	}
-
+	// For now, we don't do in-place updates of running pods
+	// The pod will be deleted when idle and recreated with new specs
 	return ctrl.Result{}, nil
 }
 
-// updateStatus updates the InferenceModel status based on deployment state
-func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *inferencev1alpha1.InferenceModel, deployment *appsv1.Deployment) (ctrl.Result, error) {
+// updateStatus updates the InferenceModel status based on pod state
+func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *inferencev1alpha1.InferenceModel, pod *corev1.Pod) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Check if status update is needed
 	oldReady := model.Status.Ready
-	oldReplicas := model.Status.Replicas
 
-	ready := deployment.Status.ReadyReplicas > 0
+	// Check if pod is ready (has PodReady condition true)
+	ready := false
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			ready = true
+			break
+		}
+	}
+
 	model.Status.Ready = ready
-	model.Status.Replicas = deployment.Status.Replicas
-	model.Status.AvailableReplicas = deployment.Status.AvailableReplicas
+	model.Status.Replicas = 1 // Single pod
+	model.Status.AvailableReplicas = 1
 
 	// Set declared memory in status
 	model.Status.DeclaredMemory = model.Spec.Resources.Memory
@@ -1385,33 +1267,28 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 	var conditionStatus metav1.ConditionStatus
 	var reason, message string
 
-	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
-		conditionStatus = metav1.ConditionFalse
-		reason = ReasonScaledToZero
-		message = "Model is scaled to zero due to inactivity"
-	} else if ready {
+	if ready {
 		conditionStatus = metav1.ConditionTrue
 		reason = ReasonDeployed
-		message = "Deployment is ready and serving traffic"
-	} else if deployment.Status.Replicas > 0 {
+		message = "Pod is ready and serving traffic"
+	} else if pod.Status.Phase == corev1.PodRunning {
 		conditionStatus = metav1.ConditionFalse
 		reason = ReasonDeploying
-		message = fmt.Sprintf("Deployment is progressing (%d/%d replicas ready)",
-			deployment.Status.ReadyReplicas, deployment.Status.Replicas)
+		message = "Pod is running but not yet ready"
 	} else {
 		conditionStatus = metav1.ConditionFalse
 		reason = ReasonPending
-		message = "Deployment is pending"
+		message = fmt.Sprintf("Pod is %s", pod.Status.Phase)
 	}
 
 	// Set Ready condition
 	setConditionOnModel(&model.Status, ConditionTypeReady, conditionStatus, reason, message)
 
-	// Set Available condition (based on ready replicas and updated replicas)
-	if deployment.Status.ReadyReplicas > 0 && deployment.Status.UnavailableReplicas == 0 {
+	// Set Available condition
+	if ready {
 		setConditionOnModel(&model.Status, ConditionTypeAvailable, metav1.ConditionTrue,
 			ReasonDeployed, "Model is available and serving requests")
-		// Update registry to indicate deployment is ready
+		// Update registry to indicate pod is ready
 		r.Registry.SetState(model.Namespace, model.Name, registry.StateReady)
 	} else {
 		setConditionOnModel(&model.Status, ConditionTypeAvailable, metav1.ConditionFalse,
@@ -1419,7 +1296,7 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 	}
 
 	// Only update if status changed
-	if oldReady != model.Status.Ready || oldReplicas != model.Status.Replicas || len(model.Status.Conditions) == 0 {
+	if oldReady != model.Status.Ready || len(model.Status.Conditions) == 0 {
 		if err := r.Status().Update(ctx, model); err != nil {
 			if errors.IsConflict(err) {
 				// Conflict is expected, requeue
@@ -1437,7 +1314,7 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 	// Structured logging with key observability fields
 	logger.V(1).Info("Updated InferenceModel status",
 		"ready", ready,
-		"replicas", model.Status.Replicas,
+		"phase", pod.Status.Phase,
 		"memory_declared", model.Spec.Resources.Memory,
 		"memory_observed_peak", model.Status.ObservedPeakMemory,
 		"utilization_percent", model.Status.UtilizationPercent,
@@ -1576,7 +1453,7 @@ func (r *InferenceModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.InferenceModel{}).
-		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Pod{}).
 		Owns(&batchv1.Job{}).
 		Watches(
 			&inferencev1alpha1.InferenceBackend{},
@@ -1588,41 +1465,19 @@ func (r *InferenceModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // UpdateLastRequestTime is called by the proxy when a request is made to a model
 // This is a public method that can be called from the proxy handler
 func (r *InferenceModelReconciler) UpdateLastRequestTime(ctx context.Context, modelName, namespace string) error {
-	deployment := &appsv1.Deployment{}
+	pod := &corev1.Pod{}
 	key := types.NamespacedName{Name: modelName, Namespace: namespace}
 
-	if err := r.Get(ctx, key, deployment); err != nil {
+	if err := r.Get(ctx, key, pod); err != nil {
 		return err
 	}
 
 	// Update the annotation
-	deploymentCopy := deployment.DeepCopy()
-	if deploymentCopy.Spec.Template.Annotations == nil {
-		deploymentCopy.Spec.Template.Annotations = make(map[string]string)
+	podCopy := pod.DeepCopy()
+	if podCopy.Annotations == nil {
+		podCopy.Annotations = make(map[string]string)
 	}
-	deploymentCopy.Spec.Template.Annotations[LastRequestAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	podCopy.Annotations[LastRequestAnnotation] = time.Now().UTC().Format(time.RFC3339)
 
-	// If scaled to zero, scale back up
-	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
-		// Fetch the InferenceModel to check memory budget
-		model := &inferencev1alpha1.InferenceModel{}
-		if err := r.Get(ctx, key, model); err != nil {
-			return err
-		}
-
-		// Check if we can allocate memory
-		if !r.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
-			return fmt.Errorf("insufficient memory budget to scale up model %s", modelName)
-		}
-
-		// Allocate memory and scale up
-		r.Tracker.Allocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
-		replicas := model.Spec.Scaling.MaxReplicas
-		if replicas == 0 {
-			replicas = 1
-		}
-		deploymentCopy.Spec.Replicas = &replicas
-	}
-
-	return r.Update(ctx, deploymentCopy)
+	return r.Update(ctx, podCopy)
 }

@@ -225,7 +225,32 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 			// Fallback to legacy behavior when registry is not available
 			if !model.Status.Ready {
 				if !s.canScaleUp(ctx, model) {
-					s.handleInsufficientMemory(c, model)
+					if s.handleInsufficientMemory(c, model) {
+						// Memory was freed via eviction, retry scale up
+						if err := s.triggerScaleUp(ctx, model); err != nil {
+							logger.Error(err, "Failed to trigger scale-up after eviction")
+							c.JSON(http.StatusInternalServerError, ErrorResponse{
+								Error: ErrorDetail{
+									Message: "Failed to scale up model: " + err.Error(),
+									Type:    "server_error",
+									Code:    "scale_up_failed",
+								},
+							})
+							return
+						}
+
+						if err := s.waitForModelReady(ctx, model); err != nil {
+							logger.Error(err, "Model failed to become ready after eviction")
+							c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+								Error: ErrorDetail{
+									Message: "Model failed to become ready: " + err.Error(),
+									Type:    "server_error",
+									Code:    "model_not_ready",
+								},
+							})
+							return
+						}
+					}
 					return
 				}
 
@@ -423,7 +448,32 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 			// Fallback to legacy behavior when registry is not available
 			if !model.Status.Ready {
 				if !s.canScaleUp(ctx, model) {
-					s.handleInsufficientMemory(c, model)
+					if s.handleInsufficientMemory(c, model) {
+						// Memory was freed via eviction, retry scale up
+						if err := s.triggerScaleUp(ctx, model); err != nil {
+							logger.Error(err, "Failed to trigger scale-up after eviction")
+							c.JSON(http.StatusInternalServerError, ErrorResponse{
+								Error: ErrorDetail{
+									Message: "Failed to scale up model: " + err.Error(),
+									Type:    "server_error",
+									Code:    "scale_up_failed",
+								},
+							})
+							return
+						}
+
+						if err := s.waitForModelReady(ctx, model); err != nil {
+							logger.Error(err, "Model failed to become ready after eviction")
+							c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+								Error: ErrorDetail{
+									Message: "Model failed to become ready: " + err.Error(),
+									Type:    "server_error",
+									Code:    "model_not_ready",
+								},
+							})
+							return
+						}
+					}
 					return
 				}
 
@@ -584,10 +634,18 @@ func (s *Server) canScaleUp(ctx context.Context, model *inferencev1alpha1.Infere
 	return s.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
 }
 
-// handleInsufficientMemory handles the case when there's not enough memory
-func (s *Server) handleInsufficientMemory(c *gin.Context, model *inferencev1alpha1.InferenceModel) {
+// handleInsufficientMemory handles the case when there's not enough memory.
+// Returns true if memory was freed via eviction and caller should retry.
+func (s *Server) handleInsufficientMemory(c *gin.Context, model *inferencev1alpha1.InferenceModel) bool {
 	ctx := c.Request.Context()
 	logger := log.FromContext(ctx)
+
+	// Try to evict idle models to free up memory
+	if s.tryEvictIdleModels(ctx, model) {
+		// Memory was freed, return true to signal retry
+		logger.Info("Memory freed via eviction, caller should retry")
+		return true
+	}
 
 	requestedMemory := resource.MustParse(model.Spec.Resources.Memory)
 	availableMemory := s.Tracker.GetAvailableMemory(model.Spec.NodeSelector)
@@ -635,6 +693,78 @@ func (s *Server) handleInsufficientMemory(c *gin.Context, model *inferencev1alph
 			},
 		},
 	})
+	return false
+}
+
+// tryEvictIdleModels attempts to evict idle models to free memory for the requested model.
+// Returns true if memory was freed and the caller should retry, false otherwise.
+func (s *Server) tryEvictIdleModels(ctx context.Context, requestedModel *inferencev1alpha1.InferenceModel) bool {
+	logger := log.FromContext(ctx)
+
+	// Check if memory-based eviction is enabled
+	if s.MaxMemoryBytes <= 0 || s.Registry == nil {
+		return false
+	}
+
+	// Get idle models sorted by last access (oldest first = LRU)
+	idleModels := s.Registry.GetIdleEntriesSorted(s.EvictionMinIdle)
+	if len(idleModels) == 0 {
+		logger.V(1).Info("No idle models available for eviction")
+		return false
+	}
+
+	requestedMemory := resource.MustParse(requestedModel.Spec.Resources.Memory)
+
+	for _, entry := range idleModels {
+		// Skip if this is the model we're trying to create
+		if entry.Name == requestedModel.Name && entry.Namespace == requestedModel.Namespace {
+			continue
+		}
+
+		// Get model's memory allocation
+		alloc := s.Tracker.GetAllocation(entry.Name, entry.Namespace)
+		if alloc == nil || alloc.Memory == nil {
+			continue
+		}
+
+		idleTime := time.Since(entry.LastRequestTime)
+		logger.Info("Evicting idle model for memory pressure",
+			"evicted_model", entry.Name,
+			"evicted_namespace", entry.Namespace,
+			"evicted_memory", alloc.Memory.String(),
+			"idle_time", idleTime.Round(time.Second),
+			"requested_model", requestedModel.Name,
+			"requested_memory", requestedMemory.String(),
+		)
+
+		// Delete the pod
+		pod := &corev1.Pod{}
+		err := s.K8sClient.Get(ctx, client.ObjectKey{Name: entry.Name, Namespace: entry.Namespace}, pod)
+		if err == nil {
+			if err := s.K8sClient.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete pod during eviction", "pod", entry.Name)
+				continue
+			}
+		}
+
+		// Release memory budget
+		s.Tracker.ReleaseModel(entry.Name, entry.Namespace)
+
+		// Remove from registry
+		s.Registry.Delete(entry.Namespace, entry.Name)
+
+		// Check if we have enough memory now
+		if s.Tracker.CanAllocate(requestedModel.Name, requestedModel.Namespace,
+			requestedModel.Spec.Resources.Memory, requestedModel.Spec.NodeSelector) {
+			logger.Info("Memory freed via eviction, can now allocate",
+				"freed_memory", alloc.Memory.String())
+			return true
+		}
+	}
+
+	logger.Info("Insufficient memory even after eviction attempts",
+		"evicted_count", len(idleModels))
+	return false
 }
 
 // triggerScaleUp triggers the creation of a pod for the model (legacy fallback)

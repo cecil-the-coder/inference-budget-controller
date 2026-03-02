@@ -17,6 +17,7 @@ limitations under the License.
 package registry
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -191,4 +192,30 @@ func (r *DeploymentRegistry) GetIdleEntries(idleTimeout time.Duration) []*Deploy
 		}
 	}
 	return result
+}
+
+// GetIdleEntriesSorted returns idle entries sorted by last request time (oldest first for LRU eviction).
+// Only includes entries that have been idle for at least minIdleTime.
+func (r *DeploymentRegistry) GetIdleEntriesSorted(minIdleTime time.Duration) []*DeploymentEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var entries []*DeploymentEntry
+	now := time.Now()
+	cutoff := now.Add(-minIdleTime)
+
+	for _, entry := range r.entries {
+		if entry.ActiveRequests == 0 && entry.LastRequestTime.Before(cutoff) {
+			// Create a copy to avoid holding the lock
+			entryCopy := *entry
+			entries = append(entries, &entryCopy)
+		}
+	}
+
+	// Sort by last request time (oldest first = LRU)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].LastRequestTime.Before(entries[j].LastRequestTime)
+	})
+
+	return entries
 }

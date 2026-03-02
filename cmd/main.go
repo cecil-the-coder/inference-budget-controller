@@ -113,6 +113,15 @@ func main() {
 	// Get HF token from secret or env
 	hfToken := os.Getenv("HF_TOKEN")
 
+	// Get memory-based scaling configuration from env
+	maxModelMemory := getEnvWithDefault("MAX_MODEL_MEMORY", "96Gi")
+	evictionMinIdleStr := getEnvWithDefault("EVICTION_MIN_IDLE", "0s")
+	evictionMinIdle, err := time.ParseDuration(evictionMinIdleStr)
+	if err != nil {
+		setupLog.Error(err, "Invalid EVICTION_MIN_IDLE duration, using default 0s")
+		evictionMinIdle = 0
+	}
+
 	// Initialize DownloadManager
 	downloadMgr := download.NewManager(
 		download.WithHFToken(hfToken),
@@ -162,6 +171,8 @@ func main() {
 		proxy.WithNamespace(proxyNamespace),
 		proxy.WithMetrics(metricsCollector),
 		proxy.WithRegistry(deploymentRegistry),
+		proxy.WithMaxModelMemory(maxModelMemory),
+		proxy.WithEvictionMinIdle(evictionMinIdle),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,4 +196,13 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// getEnvWithDefault returns the value of the environment variable key,
+// or defaultValue if the variable is not present or empty.
+func getEnvWithDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }

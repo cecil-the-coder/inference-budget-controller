@@ -237,6 +237,21 @@ func (t *Tracker) GetAllocatedMemory(nodeSelector map[string]string) *resource.Q
 	return resource.NewQuantity(0, resource.BinarySI)
 }
 
+// GetAllocation returns the memory allocation for a specific model.
+// Returns nil if the model is not allocated.
+func (t *Tracker) GetAllocation(name, namespace string) *ModelAllocation {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	key := modelKey(name, namespace)
+	if alloc, exists := t.allocations[key]; exists {
+		// Return a copy
+		copy := *alloc
+		return &copy
+	}
+	return nil
+}
+
 // GetBlockingModels returns models blocking allocation for the requested memory
 func (t *Tracker) GetBlockingModels(nodeSelector map[string]string, requestedMemory *resource.Quantity) []ModelAllocation {
 	t.mu.RLock()

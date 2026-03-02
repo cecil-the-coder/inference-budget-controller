@@ -25,6 +25,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -96,6 +97,11 @@ type Server struct {
 	ScaleUpTimeout  time.Duration
 	ReadyCheckDelay time.Duration
 
+	// Memory-based scaling configuration
+	MaxModelMemory   string        // Maximum total memory for all running models (e.g., "96Gi")
+	MaxMemoryBytes   int64         // Parsed max memory in bytes
+	EvictionMinIdle  time.Duration // Minimum idle time before a model can be evicted for memory pressure
+
 	server *http.Server
 	router *gin.Engine
 }
@@ -135,6 +141,24 @@ func WithMetrics(collector *metrics.Collector) ServerOption {
 func WithRegistry(reg *registry.DeploymentRegistry) ServerOption {
 	return func(s *Server) {
 		s.Registry = reg
+	}
+}
+
+// WithMaxModelMemory sets the maximum total memory for all running models
+func WithMaxModelMemory(maxMemory string) ServerOption {
+	return func(s *Server) {
+		s.MaxModelMemory = maxMemory
+		// Parse the memory string to bytes
+		if qty, err := resource.ParseQuantity(maxMemory); err == nil {
+			s.MaxMemoryBytes = qty.Value()
+		}
+	}
+}
+
+// WithEvictionMinIdle sets the minimum idle time before eviction for memory pressure
+func WithEvictionMinIdle(d time.Duration) ServerOption {
+	return func(s *Server) {
+		s.EvictionMinIdle = d
 	}
 }
 

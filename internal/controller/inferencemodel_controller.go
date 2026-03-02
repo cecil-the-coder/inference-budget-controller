@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -381,9 +382,22 @@ func (r *InferenceModelReconciler) buildDownloadSpec(model *inferencev1alpha1.In
 		branch = "main"
 	}
 
+	// Separate exact files from glob patterns
+	// Files containing '*' or '?' are treated as glob patterns
+	var exactFiles []string
+	var patterns []string
+	for _, f := range hf.Files {
+		if strings.Contains(f, "*") || strings.Contains(f, "?") {
+			patterns = append(patterns, f)
+		} else {
+			exactFiles = append(exactFiles, f)
+		}
+	}
+
 	return download.NewDownloadSpec(hf.Repo,
 		download.WithBranch(branch),
-		download.WithFiles(hf.Files...),
+		download.WithFiles(exactFiles...),
+		download.WithPatterns(patterns...),
 		download.WithDestDir(r.getCacheDir(model.Name)),
 	)
 }

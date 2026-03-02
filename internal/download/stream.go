@@ -94,7 +94,7 @@ func (s *StreamDownloader) DownloadLFS(ctx context.Context, repo, file, destPath
 	if err != nil {
 		return fmt.Errorf("failed to open downloaded file: %w", err)
 	}
-	defer srcFile.Close()
+	defer func() { _ = srcFile.Close() }()
 
 	// Get file size if not known
 	if totalSize == 0 {
@@ -110,7 +110,7 @@ func (s *StreamDownloader) DownloadLFS(ctx context.Context, repo, file, destPath
 	if err != nil {
 		return fmt.Errorf("failed to create destination file: %w", err)
 	}
-	defer destFile.Close()
+	defer func() { _ = destFile.Close() }()
 
 	// 7. Wrap with progress writer
 	pw := &progressWriter{
@@ -184,7 +184,7 @@ func (s *StreamDownloader) DownloadXet(ctx context.Context, repo, branch, file, 
 	if err != nil {
 		return fmt.Errorf("failed to create destination file: %w", err)
 	}
-	defer destFile.Close()
+	defer func() { _ = destFile.Close() }()
 
 	// 6. Wrap with progress writer
 	pw := &progressWriter{

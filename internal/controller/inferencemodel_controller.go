@@ -316,7 +316,9 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 		spec := r.buildDownloadSpec(model)
 
 		// Start download in goroutine
-		go r.DownloadManager.Download(ctx, model.Name, spec)
+		go func() {
+			_ = r.DownloadManager.Download(ctx, model.Name, spec)
+		}()
 	}
 
 	// Get current status

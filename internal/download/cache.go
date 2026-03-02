@@ -221,7 +221,7 @@ func (m *CacheManager) TouchModel(modelName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create marker file: %w", err)
 	}
-	file.Close()
+	_ = file.Close()
 
 	// Update the modification time
 	if err := os.Chtimes(marker, now, now); err != nil {

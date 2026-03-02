@@ -217,7 +217,7 @@ func (c *Client) fetchAuthToken(ctx context.Context) (*AuthResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("auth request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -261,7 +261,7 @@ func (c *Client) ResolveFileID(ctx context.Context, namespace, repo, branch, fil
 	if err != nil {
 		return "", fmt.Errorf("resolve request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Check for redirect and get the X-Xet-Hash header
 	fileID := resp.Header.Get("X-Xet-Hash")
@@ -296,7 +296,7 @@ func (c *Client) resolveFileIDFromURL(ctx context.Context, location string) (str
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	fileID := resp.Header.Get("X-Xet-Hash")
 	if fileID == "" {
@@ -324,7 +324,7 @@ func (c *Client) GetReconstruction(ctx context.Context, fileID string) (*Reconst
 	if err != nil {
 		return nil, fmt.Errorf("reconstruction request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -353,7 +353,7 @@ func (c *Client) FetchXorbRange(ctx context.Context, xorbURL string, start, end 
 	if err != nil {
 		return nil, fmt.Errorf("fetch request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(resp.Body)
@@ -389,7 +389,7 @@ func (c *Client) FetchXorb(ctx context.Context, xorbURL string) ([]byte, error) 
 	if err != nil {
 		return nil, fmt.Errorf("fetch request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

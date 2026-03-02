@@ -164,9 +164,9 @@ func TestClientGetReconstruction(t *testing.T) {
 				w.WriteHeader(tt.statusCode)
 				switch v := tt.response.(type) {
 				case string:
-					w.Write([]byte(v))
+					_, _ = w.Write([]byte(v))
 				default:
-					json.NewEncoder(w).Encode(v)
+					_ = json.NewEncoder(w).Encode(v)
 				}
 			}))
 			defer server.Close()
@@ -251,7 +251,7 @@ func TestClientFetchXorbRange(t *testing.T) {
 
 				w.WriteHeader(tt.statusCode)
 				if tt.data != nil {
-					w.Write(tt.data)
+					_, _ = w.Write(tt.data)
 				}
 			}))
 			defer server.Close()
@@ -320,7 +320,7 @@ func TestClientFetchXorb(t *testing.T) {
 
 				w.WriteHeader(tt.statusCode)
 				if tt.data != nil {
-					w.Write(tt.data)
+					_, _ = w.Write(tt.data)
 				}
 			}))
 			defer server.Close()
@@ -488,7 +488,7 @@ func TestClientAuth(t *testing.T) {
 				Token:     "fetched-token",
 				ExpiresAt: time.Now().Add(1 * time.Hour),
 			}
-			json.NewEncoder(w).Encode(authResp)
+			_ = json.NewEncoder(w).Encode(authResp)
 		}))
 		defer authServer.Close()
 
@@ -523,7 +523,7 @@ func TestClientAuth(t *testing.T) {
 				Token:     "cached-token",
 				ExpiresAt: time.Now().Add(1 * time.Hour),
 			}
-			json.NewEncoder(w).Encode(authResp)
+			_ = json.NewEncoder(w).Encode(authResp)
 		}))
 		defer authServer.Close()
 

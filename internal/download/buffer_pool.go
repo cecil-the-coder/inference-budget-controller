@@ -60,7 +60,7 @@ func (p *BufferPool) Put(buf []byte) {
 	// Only return buffers that match our expected size
 	// This prevents accidental returns of differently-sized slices
 	if cap(buf) >= p.bufSize {
-		p.pool.Put(buf[:p.bufSize])
+		p.pool.Put(buf[:p.bufSize:p.bufSize]) //nolint:staticcheck // SA6002: slice is fine for sync.Pool
 	}
 }
 

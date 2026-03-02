@@ -24,7 +24,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -457,62 +456,6 @@ func (r *InferenceModelReconciler) getProgressSnapshot(status *download.Status) 
 	}
 }
 
-// buildResourceRequirements creates ResourceRequirements from the InferenceModel spec and InferenceBackend
-func (r *InferenceModelReconciler) buildResourceRequirements(model *inferencev1alpha1.InferenceModel, backend *inferencev1alpha1.InferenceBackend) corev1.ResourceRequirements {
-	requirements := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{},
-		Limits:   corev1.ResourceList{},
-	}
-
-	// Set memory request from spec
-	if model.Spec.Resources.Memory != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Memory); err == nil {
-			requirements.Requests[corev1.ResourceMemory] = q
-		}
-	}
-
-	// Set CPU request from spec
-	if model.Spec.Resources.CPU != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.CPU); err == nil {
-			requirements.Requests[corev1.ResourceCPU] = q
-		}
-	}
-
-	// Set memory limit (defaults to memory request if not specified)
-	if model.Spec.Resources.MemoryLimit != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.MemoryLimit); err == nil {
-			requirements.Limits[corev1.ResourceMemory] = q
-		}
-	} else if model.Spec.Resources.Memory != "" {
-		if q, err := resource.ParseQuantity(model.Spec.Resources.Memory); err == nil {
-			requirements.Limits[corev1.ResourceMemory] = q
-		}
-	}
-
-	// Set GPU resources from backend configuration (can be overridden by model)
-	gpuConfig := backend.Spec.GPU
-	if model.Spec.BackendOverrides != nil && model.Spec.BackendOverrides.GPU != nil {
-		gpuConfig = model.Spec.BackendOverrides.GPU
-	}
-
-	if gpuConfig != nil {
-		gpuResourceName := corev1.ResourceName("nvidia.com/gpu")
-		if gpuConfig.ResourceName != "" {
-			gpuResourceName = corev1.ResourceName(gpuConfig.ResourceName)
-		} else if gpuConfig.Shared {
-			gpuResourceName = corev1.ResourceName("amd.com/gpu-shared")
-		}
-
-		if gpuConfig.Exclusive || gpuConfig.Shared {
-			// Set GPU to 1 for both exclusive and shared modes
-			requirements.Requests[gpuResourceName] = resource.MustParse("1")
-			requirements.Limits[gpuResourceName] = resource.MustParse("1")
-		}
-	}
-
-	return requirements
-}
-
 // handleIdleScaling checks if the model should be scaled to zero due to inactivity
 func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model *inferencev1alpha1.InferenceModel, pod *corev1.Pod) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -638,27 +581,6 @@ func (r *InferenceModelReconciler) deleteIdlePod(ctx context.Context, model *inf
 	r.Tracker.ReleaseModel(model.Name, model.Namespace)
 
 	return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
-}
-
-// handleUpdate checks if the pod needs to be updated based on spec changes
-// For on-demand pods, we simply delete and recreate when specs change
-func (r *InferenceModelReconciler) handleUpdate(ctx context.Context, model *inferencev1alpha1.InferenceModel, pod *corev1.Pod) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	// For on-demand pods, we don't update in place - we delete and let the proxy recreate
-	// Check if memory annotation changed
-	if pod.Annotations["inference.eh-ops.io/memory"] != model.Spec.Resources.Memory {
-		logger.Info("Pod memory annotation changed, will be updated on next creation")
-	}
-
-	// Check if node selector changed
-	if !mapsEqual(pod.Spec.NodeSelector, model.Spec.NodeSelector) {
-		logger.Info("Node selector changed, pod will use new selector on next creation")
-	}
-
-	// For now, we don't do in-place updates of running pods
-	// The pod will be deleted when idle and recreated with new specs
-	return ctrl.Result{}, nil
 }
 
 // updateStatus updates the InferenceModel status based on pod state
@@ -815,32 +737,6 @@ func setConditionOnModel(status *inferencev1alpha1.InferenceModelStatus,
 		ObservedGeneration: 0,
 	})
 
-	return true
-}
-
-// mapsEqual checks if two string maps are equal
-func mapsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if bv, ok := b[k]; !ok || bv != v {
-			return false
-		}
-	}
-	return true
-}
-
-// resourceListsEqual checks if two resource lists are equal
-func resourceListsEqual(a, b corev1.ResourceList) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if bv, ok := b[k]; !ok || !v.Equal(bv) {
-			return false
-		}
-	}
 	return true
 }
 

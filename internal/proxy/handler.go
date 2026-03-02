@@ -155,7 +155,6 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 					logger.Error(err, "Failed to ensure pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, modelName)
-					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to create pod: " + err.Error(),
@@ -177,7 +176,6 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 					logger.Error(err, "Timed out waiting for pod to become ready")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, modelName)
-					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Pod is taking too long to become ready: " + err.Error(),
@@ -210,7 +208,6 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 					logger.Error(err, "Failed to recreate pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, modelName)
-					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to recreate pod: " + err.Error(),
@@ -357,7 +354,6 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 					logger.Error(err, "Failed to ensure pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, deploymentName)
-					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to create pod: " + err.Error(),
@@ -379,7 +375,6 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 					logger.Error(err, "Timed out waiting for pod to become ready")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, deploymentName)
-					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Pod is taking too long to become ready: " + err.Error(),
@@ -412,7 +407,6 @@ func (s *Server) multipartPassthroughHandler(backendPath string) gin.HandlerFunc
 					logger.Error(err, "Failed to recreate pod")
 					// Decrement since we won't proceed to forward
 					s.Registry.FinishRequest(namespace, deploymentName)
-					requestRecorded = false
 					c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 						Error: ErrorDetail{
 							Message: "Failed to recreate pod: " + err.Error(),

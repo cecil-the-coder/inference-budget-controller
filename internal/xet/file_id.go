@@ -71,7 +71,7 @@ func ParseHuggingFaceURL(url string) (*HuggingFaceURL, error) {
 
 	namespace := parts[0]
 	repo := parts[1]
-	branch := "main"
+	var branch string
 	filePath := ""
 
 	// Handle both /resolve/{branch}/... and /blob/{branch}/... formats
@@ -79,7 +79,6 @@ func ParseHuggingFaceURL(url string) (*HuggingFaceURL, error) {
 		if len(parts) < 4 {
 			return nil, fmt.Errorf("invalid HuggingFace URL format: %s", url)
 		}
-		branch = parts[2]
 		// Get branch and filepath
 		remaining := parts[3]
 		subParts := strings.SplitN(remaining, "/", 2)

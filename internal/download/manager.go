@@ -246,6 +246,7 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 	var completedFiles int64
 	var downloadedBytes int64
 	var totalBytes int64
+	startTime := time.Now()
 
 	for i, filePath := range filesToDownload {
 		select {
@@ -269,8 +270,48 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 			return
 		}
 
+		// Start progress monitoring goroutine
+		progressCtx, progressCancel := context.WithCancel(context.Background())
+		progressDone := make(chan struct{})
+		go func() {
+			defer close(progressDone)
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			lastSize := int64(0)
+			lastTime := time.Now()
+
+			for {
+				select {
+				case <-progressCtx.Done():
+					return
+				case <-ticker.C:
+					info, err := os.Stat(localPath)
+					if err != nil {
+						continue // File doesn't exist yet
+					}
+					currentSize := info.Size()
+					now := time.Now()
+					elapsed := now.Sub(lastTime).Seconds()
+					if elapsed > 0 {
+						rate := float64(currentSize-lastSize) / elapsed / 1024 / 1024 // MB/s
+						elapsed_total := now.Sub(startTime).Seconds()
+						overallRate := float64(currentSize) / elapsed_total / 1024 / 1024 // MB/s
+						logf("Progress: %s - %.1f MB (%.1f MB/s current, %.1f MB/s overall)",
+							filePath, float64(currentSize)/1024/1024, rate, overallRate)
+					}
+					lastSize = currentSize
+					lastTime = now
+				}
+			}
+		}()
+
 		// Try Xet download first, fall back to regular download
 		downloadedSize, err := m.downloadFile(ctx, spec, filePath, localPath)
+
+		// Stop progress monitoring
+		progressCancel()
+		<-progressDone
+
 		if err != nil {
 			logf("ERROR: failed to download %s: %v", filePath, err)
 			status.SetError(fmt.Sprintf("failed to download %s: %v", filePath, err))
@@ -283,7 +324,12 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		totalBytes += downloadedSize
 		completedFiles++
 
-		logf("Completed file %d/%d: %s (%d bytes)", i+1, len(filesToDownload), filePath, downloadedSize)
+		// Calculate overall stats
+		overallDuration := time.Since(startTime)
+		overallRate := float64(downloadedBytes) / overallDuration.Seconds() / 1024 / 1024 // MB/s
+		logf("Completed file %d/%d: %s (%.1f MB in %.1fs, %.1f MB/s overall)",
+			i+1, len(filesToDownload), filePath, float64(downloadedSize)/1024/1024,
+			overallDuration.Seconds(), overallRate)
 		status.UpdateFileProgress(filePath, downloadedSize, downloadedSize, PhaseComplete)
 		status.SetProgress(downloadedBytes, totalBytes+int64(len(filesToDownload)-int(completedFiles))*1024*1024) // Estimate remaining
 	}
@@ -301,6 +347,9 @@ func (m *Manager) resolveFiles(ctx context.Context, repo *huggingface.Repository
 	if err != nil {
 		return nil, fmt.Errorf("failed to list repository files: %w", err)
 	}
+
+	fmt.Printf("[download] resolveFiles: spec.Files=%v, spec.Patterns=%v\n", spec.Files, spec.Patterns)
+	fmt.Printf("[download] resolveFiles: found %d files in repo\n", len(allFiles))
 
 	var filesToDownload []string
 
@@ -329,6 +378,7 @@ func (m *Manager) resolveFiles(ctx context.Context, repo *huggingface.Repository
 					return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
 				}
 				if matched {
+					fmt.Printf("[download] resolveFiles: pattern %q matched file %q\n", pattern, file.Name)
 					filesToDownload = append(filesToDownload, file.Name)
 					break
 				}

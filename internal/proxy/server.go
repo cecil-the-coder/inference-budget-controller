@@ -98,9 +98,9 @@ type Server struct {
 	ReadyCheckDelay time.Duration
 
 	// Memory-based scaling configuration
-	MaxModelMemory   string        // Maximum total memory for all running models (e.g., "96Gi")
-	MaxMemoryBytes   int64         // Parsed max memory in bytes
-	EvictionMinIdle  time.Duration // Minimum idle time before a model can be evicted for memory pressure
+	MaxModelMemory  string        // Maximum total memory for all running models (e.g., "96Gi")
+	MaxMemoryBytes  int64         // Parsed max memory in bytes
+	EvictionMinIdle time.Duration // Minimum idle time before a model can be evicted for memory pressure
 
 	server *http.Server
 	router *gin.Engine

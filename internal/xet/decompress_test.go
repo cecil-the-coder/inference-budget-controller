@@ -377,8 +377,8 @@ func TestDecompressorReuse(t *testing.T) {
 	compressLZ4 := func(data []byte) []byte {
 		var buf bytes.Buffer
 		writer := lz4.NewWriter(&buf)
-		writer.Write(data)
-		writer.Close()
+		_, _ = writer.Write(data)
+		_ = writer.Close()
 		return buf.Bytes()
 	}
 

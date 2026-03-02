@@ -107,9 +107,9 @@ func TestClientGetReconstruction(t *testing.T) {
 				FetchInfo: map[string][]FetchInfo{
 					"abc123": {
 						{
-							URL:     "https://storage.example.com/xorb1",
+							URL:      "https://storage.example.com/xorb1",
 							URLRange: ByteRange{Start: 0, End: 500},
-							Range:   ByteRange{Start: 0, End: 500},
+							Range:    ByteRange{Start: 0, End: 500},
 						},
 					},
 				},
@@ -349,15 +349,15 @@ func TestClientFetchXorbFromFetchInfo(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusPartialContent)
-		w.Write([]byte("test data"))
+		_, _ = w.Write([]byte("test data"))
 	}))
 	defer server.Close()
 
 	client := NewClient()
 	info := FetchInfo{
-		URL:     server.URL,
+		URL:      server.URL,
 		URLRange: ByteRange{Start: 0, End: 100},
-		Range:   ByteRange{Start: 0, End: 50},
+		Range:    ByteRange{Start: 0, End: 50},
 	}
 
 	data, err := client.FetchXorbFromFetchInfo(context.Background(), info)
@@ -382,7 +382,7 @@ func TestClientFetchXorbWithPresignedURL(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("presigned data"))
+		_, _ = w.Write([]byte("presigned data"))
 	}))
 	defer server.Close()
 

@@ -33,9 +33,9 @@ func TestParseChunkHeader(t *testing.T) {
 			wantErr: false,
 			expectedHeader: &ChunkHeader{
 				Version:          0x01,
-				CompressedSize:   256,    // 0x000100
+				CompressedSize:   256, // 0x000100
 				CompressionType:  CompressionNone,
-				UncompressedSize: 256,    // 0x000100
+				UncompressedSize: 256, // 0x000100
 			},
 		},
 		{
@@ -44,9 +44,9 @@ func TestParseChunkHeader(t *testing.T) {
 			wantErr: false,
 			expectedHeader: &ChunkHeader{
 				Version:          0x01,
-				CompressedSize:   32768,  // 0x008000
+				CompressedSize:   32768, // 0x008000
 				CompressionType:  CompressionLZ4,
-				UncompressedSize: 65536,  // 0x010000
+				UncompressedSize: 65536, // 0x010000
 			},
 		},
 		{
@@ -55,9 +55,9 @@ func TestParseChunkHeader(t *testing.T) {
 			wantErr: false,
 			expectedHeader: &ChunkHeader{
 				Version:          0x01,
-				CompressedSize:   65535,  // 0x00FFFF
+				CompressedSize:   65535, // 0x00FFFF
 				CompressionType:  CompressionByteGrouping4LZ4,
-				UncompressedSize: 65536,  // 0x010000
+				UncompressedSize: 65536, // 0x010000
 			},
 		},
 		{
@@ -213,8 +213,8 @@ func TestChunkHeaderSerialize(t *testing.T) {
 
 func TestChunkHeaderIsCompressed(t *testing.T) {
 	tests := []struct {
-		name      string
-		header    *ChunkHeader
+		name       string
+		header     *ChunkHeader
 		compressed bool
 	}{
 		{
@@ -453,13 +453,13 @@ func TestXorbIterator(t *testing.T) {
 			t.Errorf("Initial offset = %d, want 0", iter.Offset())
 		}
 
-		iter.Next()
+		_, _, _ = iter.Next()
 		expectedOffset := ChunkHeaderSize + len(chunk1Data)
 		if iter.Offset() != expectedOffset {
 			t.Errorf("After first chunk, offset = %d, want %d", iter.Offset(), expectedOffset)
 		}
 
-		iter.Next()
+		_, _, _ = iter.Next()
 		expectedOffset = 2 * (ChunkHeaderSize + len(chunk2Data))
 		if iter.Offset() != expectedOffset {
 			t.Errorf("After second chunk, offset = %d, want %d", iter.Offset(), expectedOffset)

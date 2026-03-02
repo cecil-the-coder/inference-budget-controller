@@ -27,9 +27,9 @@ import (
 
 // Downloader handles downloading files from Xet storage.
 type Downloader struct {
-	client      *Client
+	client       *Client
 	decompressor *Decompressor
-	concurrency int
+	concurrency  int
 }
 
 // DownloaderOption is a functional option for configuring the Downloader.

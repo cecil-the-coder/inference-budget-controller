@@ -118,7 +118,7 @@ func (d *Detector) Detect(ctx context.Context, repo, branch, file string) (Detec
 	if err != nil {
 		return DetectionResult{Type: StorageTypeUnknown}, fmt.Errorf("failed to make HEAD request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 3. Check for X-Xet-Hash header - indicates Xet storage
 	if xetHash := resp.Header.Get("X-Xet-Hash"); xetHash != "" {

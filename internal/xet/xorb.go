@@ -45,9 +45,9 @@ const (
 // - Compression type: 1 byte
 // - Uncompressed size: 3 bytes (little-endian)
 type ChunkHeader struct {
-	Version         byte
-	CompressedSize  uint32
-	CompressionType byte
+	Version          byte
+	CompressedSize   uint32
+	CompressionType  byte
 	UncompressedSize uint32
 }
 
@@ -58,8 +58,8 @@ func ParseChunkHeader(data []byte) (*ChunkHeader, error) {
 	}
 
 	header := &ChunkHeader{
-		Version:          data[0],
-		CompressionType:  data[4],
+		Version:         data[0],
+		CompressionType: data[4],
 	}
 
 	// 3-byte little-endian compressed size

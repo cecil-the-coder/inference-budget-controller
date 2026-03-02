@@ -22,10 +22,10 @@ import (
 
 func TestParseHuggingFaceURL(t *testing.T) {
 	tests := []struct {
-		name        string
-		url         string
-		wantErr     bool
-		expected    *HuggingFaceURL
+		name     string
+		url      string
+		wantErr  bool
+		expected *HuggingFaceURL
 	}{
 		// Standard huggingface.co URLs with /resolve/
 		{

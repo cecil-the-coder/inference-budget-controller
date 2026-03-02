@@ -34,7 +34,7 @@ import (
 func mockReconstructionServer(t *testing.T, fileID string, recon *ReconstructionResponse) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/reconstructions/"+fileID {
-			json.NewEncoder(w).Encode(recon)
+			_ = json.NewEncoder(w).Encode(recon)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -58,11 +58,11 @@ func mockXorbServer(t *testing.T, xorbData []byte) *httptest.Server {
 			}
 			w.Header().Set("Content-Range", r.Header.Get("Range"))
 			w.WriteHeader(http.StatusPartialContent)
-			w.Write(xorbData[start : end+1])
+			_, _ = w.Write(xorbData[start : end+1])
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write(xorbData)
+		_, _ = w.Write(xorbData)
 	}))
 }
 
@@ -84,7 +84,7 @@ func sscanf(s, format string, a ...interface{}) (int, error) {
 	if len(s) < 7 || s[:6] != "bytes=" {
 		return 0, os.ErrInvalid
 	}
- nums := s[6:]
+	nums := s[6:]
 	dash := -1
 	for i, c := range nums {
 		if c == '-' {
@@ -145,8 +145,8 @@ func createTestXorbDataLZ4(t *testing.T, originalChunks [][]byte) []byte {
 		// Compress with LZ4
 		var buf bytes.Buffer
 		writer := lz4.NewWriter(&buf)
-		writer.Write(chunk)
-		writer.Close()
+		_, _ = writer.Write(chunk)
+		_ = writer.Close()
 		compressed := buf.Bytes()
 
 		header := &ChunkHeader{
@@ -210,9 +210,9 @@ func TestDownloaderDownloadData(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash1": {
 				{
-					URL:     xorbServer.URL,
+					URL:      xorbServer.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData))},
 				},
 			},
 		},
@@ -260,9 +260,9 @@ func TestDownloaderDownloadDataLZ4(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash-lz4": {
 				{
-					URL:     xorbServer.URL,
+					URL:      xorbServer.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData))},
 				},
 			},
 		},
@@ -308,9 +308,9 @@ func TestDownloaderDownloadToWriter(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash-writer": {
 				{
-					URL:     xorbServer.URL,
+					URL:      xorbServer.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData))},
 				},
 			},
 		},
@@ -357,9 +357,9 @@ func TestDownloaderDownloadToFile(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash-file": {
 				{
-					URL:     xorbServer.URL,
+					URL:      xorbServer.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData))},
 				},
 			},
 		},
@@ -415,9 +415,9 @@ func TestDownloaderDownloadCreatesDirectory(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash-mkdir": {
 				{
-					URL:     xorbServer.URL,
+					URL:      xorbServer.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData))},
 				},
 			},
 		},
@@ -556,9 +556,9 @@ func TestDownloaderNetworkError(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash-network": {
 				{
-					URL:     "http://nonexistent.invalid/xorb",
+					URL:      "http://nonexistent.invalid/xorb",
 					URLRange: ByteRange{Start: 0, End: 50},
-					Range:   ByteRange{Start: 0, End: 50},
+					Range:    ByteRange{Start: 0, End: 50},
 				},
 			},
 		},
@@ -642,16 +642,16 @@ func TestDownloaderMultipleTerms(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash1": {
 				{
-					URL:     xorbServer1.URL,
+					URL:      xorbServer1.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData1))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData1))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData1))},
 				},
 			},
 			"hash2": {
 				{
-					URL:     xorbServer2.URL,
+					URL:      xorbServer2.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData2))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData2))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData2))},
 				},
 			},
 		},
@@ -700,9 +700,9 @@ func TestDownloaderLargeData(t *testing.T) {
 		FetchInfo: map[string][]FetchInfo{
 			"hash-large": {
 				{
-					URL:     xorbServer.URL,
+					URL:      xorbServer.URL,
 					URLRange: ByteRange{Start: 0, End: int64(len(xorbData))},
-					Range:   ByteRange{Start: 0, End: int64(len(xorbData))},
+					Range:    ByteRange{Start: 0, End: int64(len(xorbData))},
 				},
 			},
 		},

@@ -28,8 +28,8 @@ const (
 // BufferPool provides reusable byte buffers for memory-efficient streaming.
 // Using a pool reduces memory allocations and GC pressure during large file downloads.
 type BufferPool struct {
-	pool     sync.Pool
-	bufSize  int
+	pool    sync.Pool
+	bufSize int
 }
 
 // NewBufferPool creates a new buffer pool with the specified buffer size.

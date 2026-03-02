@@ -1172,8 +1172,8 @@ func (s *Server) buildPod(model *inferencev1alpha1.InferenceModel, backend *infe
 			Namespace: model.Namespace,
 			Labels:    labels,
 			Annotations: map[string]string{
-				"inference.eh-ops.io/memory":         model.Spec.Resources.Memory,
-				"inference.eh-ops.io/backend":        model.Spec.Backend,
+				"inference.eh-ops.io/memory":            model.Spec.Resources.Memory,
+				"inference.eh-ops.io/backend":           model.Spec.Backend,
 				"inference.eh-ops.io/last-request-time": time.Now().UTC().Format(time.RFC3339),
 			},
 		},
@@ -1365,7 +1365,7 @@ func (s *Server) buildMainContainer(
 				},
 			},
 			InitialDelaySeconds: 0, // StartupProbe handles initial delay
-			PeriodSeconds: 10, TimeoutSeconds: 5,
+			PeriodSeconds:       10, TimeoutSeconds: 5,
 			SuccessThreshold: 1, FailureThreshold: 3,
 		},
 		LivenessProbe: &corev1.Probe{
@@ -1376,7 +1376,7 @@ func (s *Server) buildMainContainer(
 				},
 			},
 			InitialDelaySeconds: 0, // StartupProbe handles initial delay
-			PeriodSeconds: 30, TimeoutSeconds: 5, FailureThreshold: 3,
+			PeriodSeconds:       30, TimeoutSeconds: 5, FailureThreshold: 3,
 		},
 		Args: args,
 	}

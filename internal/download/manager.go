@@ -352,6 +352,7 @@ func (m *Manager) resolveFiles(ctx context.Context, repo *huggingface.Repository
 	fmt.Printf("[download] resolveFiles: found %d files in repo\n", len(allFiles))
 
 	var filesToDownload []string
+	seen := make(map[string]bool) // Track which files we've already added
 
 	for _, file := range allFiles {
 		// Check if file should be excluded
@@ -360,34 +361,45 @@ func (m *Manager) resolveFiles(ctx context.Context, repo *huggingface.Repository
 		}
 
 		// Check if file matches any explicit file list
-		if len(spec.Files) > 0 {
-			for _, f := range spec.Files {
-				if file.Name == f {
+		matched := false
+		for _, f := range spec.Files {
+			if file.Name == f {
+				if !seen[file.Name] {
 					filesToDownload = append(filesToDownload, file.Name)
-					break
+					seen[file.Name] = true
 				}
+				matched = true
+				break
 			}
+		}
+		if matched {
 			continue
 		}
 
 		// Check if file matches any pattern
-		if len(spec.Patterns) > 0 {
-			for _, pattern := range spec.Patterns {
-				matched, err := filepath.Match(pattern, file.Name)
-				if err != nil {
-					return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
-				}
-				if matched {
-					fmt.Printf("[download] resolveFiles: pattern %q matched file %q\n", pattern, file.Name)
-					filesToDownload = append(filesToDownload, file.Name)
-					break
-				}
+		for _, pattern := range spec.Patterns {
+			matched, err := filepath.Match(pattern, file.Name)
+			if err != nil {
+				return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
 			}
-			continue
+			if matched {
+				fmt.Printf("[download] resolveFiles: pattern %q matched file %q\n", pattern, file.Name)
+				if !seen[file.Name] {
+					filesToDownload = append(filesToDownload, file.Name)
+					seen[file.Name] = true
+				}
+				break
+			}
 		}
+	}
 
-		// If no files or patterns specified, download all files
-		filesToDownload = append(filesToDownload, file.Name)
+	// If no files or patterns specified, download all files
+	if len(spec.Files) == 0 && len(spec.Patterns) == 0 {
+		for _, file := range allFiles {
+			if !m.shouldExclude(file.Name, spec.Exclude) {
+				filesToDownload = append(filesToDownload, file.Name)
+			}
+		}
 	}
 
 	return filesToDownload, nil

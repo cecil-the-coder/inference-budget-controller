@@ -1146,15 +1146,17 @@ func (s *Server) buildPod(model *inferencev1alpha1.InferenceModel, backend *infe
 	envVars := buildContainerEnv(model, backend, port)
 	volumes, volumeMounts := buildVolumeConfig(model, backend)
 
+	// Resolve source paths first so we can use them for env vars
+	paths := resolveSourcePaths(model)
+
 	// Add HF_SOURCE env var for HuggingFace models
 	if model.Spec.Source.HuggingFace != nil && model.Spec.Storage.PVC != "" {
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "HF_SOURCE",
-			Value: getModelDir(model),
+			Value: paths.hfSource,
 		})
 	}
 
-	paths := resolveSourcePaths(model)
 	args := buildContainerArgs(model, backend, paths)
 
 	container := s.buildMainContainer(model, backend, port, readinessPath, livenessPath, envVars, volumeMounts, args)

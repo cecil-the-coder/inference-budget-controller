@@ -141,8 +141,11 @@ func NewManager(opts ...Option) *Manager {
 // This method is non-blocking - it starts the download in a goroutine and returns immediately.
 // Use GetStatus to check the download progress.
 func (m *Manager) Download(ctx context.Context, modelName string, spec *DownloadSpec) error {
+	fmt.Printf("[download:%s] Download() called, repo=%s\n", modelName, spec.Repo)
+
 	// Check if already downloading
 	if _, exists := m.downloads.Load(modelName); exists {
+		fmt.Printf("[download:%s] Download already in progress\n", modelName)
 		return fmt.Errorf("download already in progress for model: %s", modelName)
 	}
 
@@ -159,6 +162,7 @@ func (m *Manager) Download(ctx context.Context, modelName string, spec *Download
 
 	// Store status
 	m.downloads.Store(modelName, status)
+	fmt.Printf("[download:%s] Status stored, starting goroutine\n", modelName)
 
 	// Start download in background
 	go m.performDownload(dlCtx, modelName, spec, status)
@@ -168,13 +172,20 @@ func (m *Manager) Download(ctx context.Context, modelName string, spec *Download
 
 // performDownload executes the actual download in a goroutine.
 func (m *Manager) performDownload(ctx context.Context, modelName string, spec *DownloadSpec, status *Status) {
+	logf := func(format string, args ...interface{}) {
+		fmt.Printf("[download:%s] %s\n", modelName, fmt.Sprintf(format, args...))
+	}
+
+	logf("Waiting for semaphore slot...")
 	// Acquire semaphore slot
 	m.semaphore <- struct{}{}
 	defer func() { <-m.semaphore }()
+	logf("Semaphore slot acquired, starting download")
 
 	// Check for cancellation
 	select {
 	case <-ctx.Done():
+		logf("Download cancelled while waiting for semaphore")
 		status.SetError("download cancelled")
 		return
 	default:
@@ -182,37 +193,46 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 
 	// Update status to downloading
 	status.SetPhase(PhaseDownloading)
+	logf("Status set to Downloading")
 
 	// Determine destination directory
 	destDir := spec.DestDir
 	if destDir == "" {
 		destDir = filepath.Join(m.cacheDir, "models", strings.ReplaceAll(modelName, "/", "--"))
 	}
+	logf("Destination directory: %s", destDir)
 
 	// Create destination directory
 	if err := os.MkdirAll(destDir, 0755); err != nil {
+		logf("ERROR: failed to create destination directory: %v", err)
 		status.SetError(fmt.Sprintf("failed to create destination directory: %v", err))
 		return
 	}
 
 	// Create repository handle
+	logf("Creating repository handle for: %s", spec.Repo)
 	repo, err := m.hfClient.NewModelRepository(ctx, spec.Repo)
 	if err != nil {
+		logf("ERROR: failed to create repository handle: %v", err)
 		status.SetError(fmt.Sprintf("failed to create repository handle: %v", err))
 		return
 	}
 
 	// Get list of files to download
+	logf("Resolving files to download...")
 	filesToDownload, err := m.resolveFiles(ctx, repo, spec)
 	if err != nil {
+		logf("ERROR: failed to resolve files: %v", err)
 		status.SetError(fmt.Sprintf("failed to resolve files: %v", err))
 		return
 	}
 
 	if len(filesToDownload) == 0 {
+		logf("ERROR: no files to download")
 		status.SetError("no files to download")
 		return
 	}
+	logf("Files to download: %v", filesToDownload)
 
 	// Initialize file statuses
 	fileSizes := make(map[string]int64)
@@ -227,14 +247,16 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 	var downloadedBytes int64
 	var totalBytes int64
 
-	for _, filePath := range filesToDownload {
+	for i, filePath := range filesToDownload {
 		select {
 		case <-ctx.Done():
+			logf("Download cancelled during file %s", filePath)
 			status.SetError("download cancelled")
 			return
 		default:
 		}
 
+		logf("Downloading file %d/%d: %s", i+1, len(filesToDownload), filePath)
 		// Update file status to downloading
 		status.UpdateFileProgress(filePath, 0, 0, PhaseDownloading)
 
@@ -242,6 +264,7 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		localPath := filepath.Join(destDir, filePath)
 		fileDir := filepath.Dir(localPath)
 		if err := os.MkdirAll(fileDir, 0755); err != nil {
+			logf("ERROR: failed to create directory for %s: %v", filePath, err)
 			status.SetError(fmt.Sprintf("failed to create directory for %s: %v", filePath, err))
 			return
 		}
@@ -249,6 +272,7 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		// Try Xet download first, fall back to regular download
 		downloadedSize, err := m.downloadFile(ctx, spec, filePath, localPath)
 		if err != nil {
+			logf("ERROR: failed to download %s: %v", filePath, err)
 			status.SetError(fmt.Sprintf("failed to download %s: %v", filePath, err))
 			return
 		}
@@ -259,6 +283,7 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		totalBytes += downloadedSize
 		completedFiles++
 
+		logf("Completed file %d/%d: %s (%d bytes)", i+1, len(filesToDownload), filePath, downloadedSize)
 		status.UpdateFileProgress(filePath, downloadedSize, downloadedSize, PhaseComplete)
 		status.SetProgress(downloadedBytes, totalBytes+int64(len(filesToDownload)-int(completedFiles))*1024*1024) // Estimate remaining
 	}
@@ -266,6 +291,7 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 	// Mark as complete
 	status.SetProgress(totalBytes, totalBytes)
 	status.SetComplete()
+	logf("Download complete! Total bytes: %d", totalBytes)
 }
 
 // resolveFiles determines which files to download based on the spec.

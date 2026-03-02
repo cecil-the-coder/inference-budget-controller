@@ -555,7 +555,22 @@ func (r *InferenceModelReconciler) deleteIdlePod(ctx context.Context, model *inf
 		}
 	}
 
-	// Delete the pod - ignore NotFound errors (already deleted by another reconcile)
+	// Check if the model is already being scaled down by another reconcile loop
+	// This acts as a distributed lock to prevent multiple concurrent deletions
+	if isScaledDown(model) {
+		logger.Info("Model is already being scaled down, skipping", "model", model.Name)
+		return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+	}
+
+	// Set the "ScaledToZero" condition FIRST as a distributed lock
+	// This prevents other reconcile loops from proceeding with deletion
+	if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,
+		ReasonScaledToZero, "Model pod deleted due to inactivity"); err != nil {
+		logger.Error(err, "failed to set scaled-to-zero condition")
+		return ctrl.Result{}, fmt.Errorf("failed to set scaled-to-zero condition: %w", err)
+	}
+
+	// Now delete the pod
 	if err := r.Delete(ctx, pod); err != nil {
 		if errors.IsNotFound(err) {
 			logger.Info("Pod already deleted", "model", model.Name, "pod", pod.Name)
@@ -575,28 +590,20 @@ func (r *InferenceModelReconciler) deleteIdlePod(ctx context.Context, model *inf
 		logger.Info("Removed model from registry", "model", model.Name)
 	}
 
-	// Re-fetch the model to get the latest resource version before updating status
-	latestModel := &inferencev1alpha1.InferenceModel{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: model.Namespace, Name: model.Name}, latestModel); err != nil {
-		if errors.IsNotFound(err) {
-			logger.Info("Model no longer exists, skipping status update")
-			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
-		}
-		logger.Error(err, "failed to re-fetch model for status update")
-		return ctrl.Result{}, err
-	}
-
-	// Update status with the latest resource version
-	if err := r.setCondition(ctx, latestModel, ConditionTypeReady, metav1.ConditionFalse,
-		ReasonScaledToZero, "Model pod deleted due to inactivity"); err != nil {
-		logger.Error(err, "failed to update status condition")
-		// Don't return error - status update failure shouldn't trigger retry
-	}
-
 	// Release memory budget (idempotent)
 	r.Tracker.ReleaseModel(model.Name, model.Namespace)
 
 	return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+}
+
+// isScaledDown checks if the model is already in scaled-to-zero state
+func isScaledDown(model *inferencev1alpha1.InferenceModel) bool {
+	for _, cond := range model.Status.Conditions {
+		if cond.Type == ConditionTypeReady {
+			return cond.Status == metav1.ConditionFalse && cond.Reason == ReasonScaledToZero
+		}
+	}
+	return false
 }
 
 // updateStatus updates the InferenceModel status based on pod state

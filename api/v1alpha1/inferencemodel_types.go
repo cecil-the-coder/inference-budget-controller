@@ -261,6 +261,21 @@ const (
 	DownloadPhaseFailed      DownloadPhase = "Failed"
 )
 
+// FileDownloadStatus represents the status of a single file download.
+type FileDownloadStatus struct {
+	// Path is the file path within the repository.
+	Path string `json:"path"`
+
+	// Phase is the current download phase for this file.
+	Phase string `json:"phase"`
+
+	// BytesDone is the number of bytes downloaded for this file.
+	BytesDone int64 `json:"bytesDone"`
+
+	// BytesTotal is the total size of this file.
+	BytesTotal int64 `json:"bytesTotal"`
+}
+
 // InferenceModelStatus defines the observed state of InferenceModel
 type InferenceModelStatus struct {
 	// Phase is the current lifecycle phase
@@ -274,6 +289,30 @@ type InferenceModelStatus struct {
 
 	// DownloadMessage contains details about the download
 	DownloadMessage string `json:"downloadMessage,omitempty"`
+
+	// DownloadBytesTotal is the total number of bytes to download
+	DownloadBytesTotal int64 `json:"downloadBytesTotal,omitempty"`
+
+	// DownloadBytesDone is the number of bytes already downloaded
+	DownloadBytesDone int64 `json:"downloadBytesDone,omitempty"`
+
+	// DownloadSpeed is the current download speed in bytes per second
+	DownloadSpeed int64 `json:"downloadSpeed,omitempty"`
+
+	// DownloadETA is the estimated time remaining for the download
+	DownloadETA string `json:"downloadETA,omitempty"`
+
+	// DownloadFiles contains the status of individual files being downloaded
+	DownloadFiles []FileDownloadStatus `json:"downloadFiles,omitempty"`
+
+	// DownloadError contains the error message if the download failed
+	DownloadError string `json:"downloadError,omitempty"`
+
+	// DownloadStartedAt is when the download started
+	DownloadStartedAt *metav1.Time `json:"downloadStartedAt,omitempty"`
+
+	// DownloadCompletedAt is when the download finished
+	DownloadCompletedAt *metav1.Time `json:"downloadCompletedAt,omitempty"`
 
 	// Ready indicates if the model is ready to serve requests
 	Ready bool `json:"ready"`

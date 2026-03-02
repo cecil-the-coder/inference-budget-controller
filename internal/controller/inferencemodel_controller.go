@@ -19,10 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
+	"path/filepath"
 	"time"
 
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -39,6 +38,7 @@ import (
 
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/budget"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/download"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/registry"
 )
@@ -83,11 +83,13 @@ const (
 // InferenceModelReconciler reconciles a InferenceModel object
 type InferenceModelReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
-	Tracker  *budget.Tracker
-	Metrics  *metrics.Collector
-	Registry *registry.DeploymentRegistry
+	Scheme          *runtime.Scheme
+	Recorder        record.EventRecorder
+	Tracker         *budget.Tracker
+	Metrics         *metrics.Collector
+	Registry        *registry.DeploymentRegistry
+	DownloadManager *download.Manager
+	CacheManager    *download.CacheManager
 }
 
 //+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencemodels,verbs=get;list;watch;create;update;patch;delete
@@ -97,8 +99,6 @@ type InferenceModelReconciler struct {
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -138,20 +138,13 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseComplete {
 			logger.Info("Retry annotation detected, clearing and re-downloading", "model", model.Name, "currentPhase", model.Status.DownloadPhase)
 
-			// Delete the existing download job if it exists
-			jobName := getDownloadJobName(model)
-			job := &batchv1.Job{}
-			err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: model.Namespace}, job)
-			if err == nil {
-				// Job exists, delete it with background propagation so we can recreate it
-				if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-					logger.Error(err, "failed to delete download job for retry")
-					return ctrl.Result{}, fmt.Errorf("failed to delete download job: %w", err)
-				}
-				logger.Info("Deleted download job for retry", "model", model.Name, "job", jobName)
-			} else if !errors.IsNotFound(err) {
-				logger.Error(err, "failed to fetch download job for retry")
-				return ctrl.Result{}, fmt.Errorf("failed to fetch download job: %w", err)
+			// Cancel any existing download
+			r.DownloadManager.Cancel(model.Name)
+
+			// Remove the ready marker to force re-download
+			cacheDir := r.getCacheDir(model.Name)
+			if err := download.RemoveReadyMarker(cacheDir); err != nil {
+				logger.Error(err, "failed to remove ready marker for retry")
 			}
 
 			// Remove the retry annotation
@@ -162,7 +155,11 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			}
 
 			// Reset download status to pending to trigger a new download
-			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhasePending, 0, "Retry requested"); err != nil {
+			model.Status.DownloadPhase = inferencev1alpha1.DownloadPhasePending
+			model.Status.DownloadProgress = 0
+			model.Status.DownloadMessage = "Retry requested"
+			model.Status.DownloadError = ""
+			if err := r.Status().Update(ctx, model); err != nil {
 				logger.Error(err, "failed to reset download status for retry")
 				return ctrl.Result{}, fmt.Errorf("failed to reset download status: %w", err)
 			}
@@ -263,19 +260,8 @@ func (r *InferenceModelReconciler) handleDeletion(ctx context.Context, model *in
 	// Remove from registry
 	r.Registry.Delete(model.Namespace, model.Name)
 
-	// Clean up model files from shared/existing PVC if needed
-	if r.needsModelCleanup(model) {
-		result, err := r.createCleanupJob(ctx, model)
-		if err != nil {
-			logger.Error(err, "failed to create cleanup job")
-			r.Recorder.Event(model, corev1.EventTypeWarning, "CleanupFailed",
-				fmt.Sprintf("Failed to create cleanup job: %v", err))
-			// Continue with deletion even if cleanup fails
-		} else if result.RequeueAfter > 0 {
-			// Wait for cleanup job to complete
-			return result, nil
-		}
-	}
+	// Note: Model files on shared PVCs are not automatically cleaned up.
+	// If cleanup is needed, it should be done manually or via a separate process.
 
 	// Remove finalizer
 	if err := r.removeFinalizer(ctx, model); err != nil {
@@ -286,34 +272,6 @@ func (r *InferenceModelReconciler) handleDeletion(ctx context.Context, model *in
 	r.Recorder.Event(model, corev1.EventTypeNormal, "Deleted", "Memory budget released and finalizer removed")
 
 	return ctrl.Result{}, nil
-}
-
-// needsModelCleanup returns true if model files should be cleaned up from a shared/existing PVC
-func (r *InferenceModelReconciler) needsModelCleanup(model *inferencev1alpha1.InferenceModel) bool {
-	storage := model.Spec.Storage
-
-	// Only clean up if using HuggingFace source (downloaded models)
-	if model.Spec.Source.HuggingFace == nil {
-		return false
-	}
-
-	// Only clean up if download was complete (files exist on PVC)
-	if model.Status.DownloadPhase != inferencev1alpha1.DownloadPhaseComplete {
-		return false
-	}
-
-	// Clean up if using a shared PVC (Shared is true)
-	if storage.Shared {
-		return true
-	}
-
-	// Clean up if using an existing PVC (Create is false and PVC is specified)
-	if storage.PVC != "" && !storage.Create {
-		return true
-	}
-
-	// Don't clean up auto-created PVCs - they will be deleted by K8s garbage collection
-	return false
 }
 
 // addFinalizer adds the finalizer to the InferenceModel
@@ -335,695 +293,166 @@ func (r *InferenceModelReconciler) removeFinalizer(ctx context.Context, model *i
 	return r.Update(ctx, modelCopy)
 }
 
-// handleDownload handles the HuggingFace model download process
+// handleDownload handles the HuggingFace model download process using DownloadManager
 func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *inferencev1alpha1.InferenceModel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Check if download has already failed
-	if model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseFailed {
-		logger.Info("Download previously failed, not retrying", "model", model.Name)
-		return ctrl.Result{}, nil
-	}
-
-	// Check for existing download job
-	jobName := getDownloadJobName(model)
-	job := &batchv1.Job{}
-	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: model.Namespace}, job)
-
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// Job doesn't exist, need to create it
-			return r.createDownloadJob(ctx, model)
+	// Check if model is already cached (ready marker exists)
+	cacheDir := r.getCacheDir(model.Name)
+	if download.CheckReadyMarker(cacheDir) {
+		model.Status.DownloadPhase = inferencev1alpha1.DownloadPhaseComplete
+		if err := r.Status().Update(ctx, model); err != nil {
+			return ctrl.Result{}, err
 		}
-		logger.Error(err, "unable to fetch download Job")
-		return ctrl.Result{}, fmt.Errorf("failed to fetch download job: %w", err)
+		return r.transitionToDeploying(ctx, model)
 	}
 
-	// Check if job has failed and we need to clean it up for retry
-	// This handles the case where the job failed but status hasn't been updated yet
-	// or when retrying after a failed download
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			// Job has failed, delete it so we can create a new one
-			logger.Info("Found failed download job, deleting it for retry", "model", model.Name, "job", jobName)
-			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-				logger.Error(err, "failed to delete failed download job")
-				return ctrl.Result{}, fmt.Errorf("failed to delete failed download job: %w", err)
-			}
-			// Requeue to create a new job
-			return ctrl.Result{Requeue: true}, nil
+	// Start download if not already running
+	if !r.DownloadManager.IsDownloading(model.Name) {
+		logger.Info("Starting model download", "model", model.Name)
+		r.Recorder.Event(model, "Normal", "DownloadStarted", "Starting model download")
+
+		// Build download spec from model CRD
+		spec := r.buildDownloadSpec(model)
+
+		// Start download in goroutine
+		go r.DownloadManager.Download(ctx, model.Name, spec)
+	}
+
+	// Get current status
+	status := r.DownloadManager.GetStatus(model.Name)
+	if status == nil {
+		// Download not yet started, requeue
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+
+	// Update CRD status
+	model.Status.DownloadPhase = convertDownloadPhase(status.Phase)
+	model.Status.DownloadProgress = int32(status.Progress)
+	model.Status.DownloadBytesTotal = status.BytesTotal
+	model.Status.DownloadBytesDone = status.BytesDone
+	model.Status.DownloadSpeed = status.GetBytesDone() / int64(status.Duration().Seconds()+1)
+
+	// Get progress snapshot for ETA
+	snapshot := r.getProgressSnapshot(status)
+	if snapshot.ETA > 0 {
+		model.Status.DownloadETA = formatDuration(snapshot.ETA)
+	}
+
+	if err := r.Status().Update(ctx, model); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Handle completion/failure
+	switch status.Phase {
+	case download.PhaseComplete:
+		logger.Info("Model download complete", "model", model.Name)
+		r.Recorder.Event(model, "Normal", "DownloadComplete",
+			fmt.Sprintf("Downloaded %d bytes in %s", status.BytesDone, status.Duration()))
+
+		// Write ready marker
+		if err := download.WriteReadyMarker(cacheDir); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to write ready marker: %w", err)
 		}
-	}
 
-	// Job exists, check its status
-	return r.checkDownloadJobStatus(ctx, model, job)
+		return r.transitionToDeploying(ctx, model)
+
+	case download.PhaseFailed:
+		err := fmt.Errorf("download failed: %s", status.Error)
+		logger.Error(err, "Model download failed", "model", model.Name)
+		r.Recorder.Event(model, "Warning", "DownloadFailed", status.Error)
+		model.Status.DownloadError = status.Error
+		return ctrl.Result{}, err
+
+	default:
+		// Still downloading, requeue
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 }
 
-// getDownloadJobName returns the name for the download job
-func getDownloadJobName(model *inferencev1alpha1.InferenceModel) string {
-	return model.Name + "-download"
-}
-
-// createDownloadJob creates a new download job for the model
-func (r *InferenceModelReconciler) createDownloadJob(ctx context.Context, model *inferencev1alpha1.InferenceModel) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
+// buildDownloadSpec builds a DownloadSpec from the InferenceModel CRD
+func (r *InferenceModelReconciler) buildDownloadSpec(model *inferencev1alpha1.InferenceModel) *download.DownloadSpec {
 	hf := model.Spec.Source.HuggingFace
 
-	// Ensure PVC exists or create it
-	pvcName, err := r.ensurePVC(ctx, model)
-	if err != nil {
-		logger.Error(err, "failed to ensure PVC for model download")
-		return ctrl.Result{}, fmt.Errorf("failed to ensure PVC: %w", err)
+	// Use revision as branch if specified
+	branch := hf.Revision
+	if branch == "" {
+		branch = "main"
 	}
 
-	// Build the download command
-	modelDir := getModelDir(model)
-	downloadCmd := r.buildDownloadCommand(hf, modelDir)
-
-	// Build environment variables
-	envVars := []corev1.EnvVar{
-		{
-			Name:  "HF_REPO",
-			Value: hf.Repo,
-		},
-		{
-			Name:  "MODEL_DIR",
-			Value: modelDir,
-		},
-	}
-
-	// Add HF_TOKEN from secret if specified
-	if hf.TokenSecret != "" {
-		secretKey := hf.TokenSecretKey
-		if secretKey == "" {
-			secretKey = "token"
-		}
-		envVars = append(envVars, corev1.EnvVar{
-			Name: "HF_TOKEN",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: hf.TokenSecret,
-					},
-					Key: secretKey,
-				},
-			},
-		})
-	}
-
-	// Build the job
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      getDownloadJobName(model),
-			Namespace: model.Namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      model.Name,
-				"app.kubernetes.io/component": "model-download",
-				"inference.eh-ops.io/model":   model.Spec.ModelName,
-				"inference.eh-ops.io/managed": "true",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:    "download",
-							Image:   "python:3.11-slim",
-							Command: []string{"sh", "-c", downloadCmd},
-							Env:     envVars,
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "model-cache",
-									MountPath: "/models",
-								},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "model-cache",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: pvcName,
-								},
-							},
-						},
-					},
-					RestartPolicy: corev1.RestartPolicyOnFailure,
-				},
-			},
-		},
-	}
-
-	// Set owner reference
-	if err := controllerutil.SetControllerReference(model, job, r.Scheme); err != nil {
-		logger.Error(err, "failed to set controller reference on download job")
-		return ctrl.Result{}, fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	// Create the job
-	if err := r.Create(ctx, job); err != nil {
-		if errors.IsAlreadyExists(err) {
-			logger.Info("Download job already exists, requeuing")
-			return ctrl.Result{Requeue: true}, nil
-		}
-		logger.Error(err, "failed to create download job")
-		r.Recorder.Event(model, corev1.EventTypeWarning, "DownloadFailed",
-			fmt.Sprintf("Failed to create download job: %v", err))
-		return ctrl.Result{}, fmt.Errorf("failed to create download job: %w", err)
-	}
-
-	logger.Info("Created download job for model",
-		"model", model.Name,
-		"repo", hf.Repo,
-		"job", job.Name)
-
-	r.Recorder.Event(model, corev1.EventTypeNormal, "DownloadStarted",
-		fmt.Sprintf("Started download job for HuggingFace model %s", hf.Repo))
-
-	// Update status to Downloading
-	if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseDownloading, 0, "Download job created"); err != nil {
-		logger.Error(err, "failed to update download status")
-	}
-
-	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+	return download.NewDownloadSpec(hf.Repo,
+		download.WithBranch(branch),
+		download.WithFiles(hf.Files...),
+		download.WithDestDir(r.getCacheDir(model.Name)),
+	)
 }
 
-// checkDownloadJobStatus checks the status of a download job and updates the model status
-func (r *InferenceModelReconciler) checkDownloadJobStatus(ctx context.Context, model *inferencev1alpha1.InferenceModel, job *batchv1.Job) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	// Check job conditions
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			// Job completed successfully, but we need to verify the .ready file exists
-			logger.Info("Download job completed, verifying .ready file exists", "model", model.Name)
-
-			return r.verifyReadyFileAndComplete(ctx, model, job)
-		}
-
-		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			// Job failed
-			logger.Info("Download job failed", "model", model.Name, "reason", condition.Reason, "message", condition.Message)
-
-			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseFailed, 0,
-				fmt.Sprintf("Download failed: %s", condition.Message)); err != nil {
-				logger.Error(err, "failed to update download status")
-				return ctrl.Result{}, err
-			}
-
-			r.Recorder.Event(model, corev1.EventTypeWarning, "DownloadFailed",
-				fmt.Sprintf("Model download failed: %s", condition.Message))
-
-			return ctrl.Result{}, nil
-		}
-	}
-
-	// Job is still running
-	logger.V(1).Info("Download job still running", "model", model.Name)
-
-	// Update status to Downloading if not already set
-	if model.Status.DownloadPhase != inferencev1alpha1.DownloadPhaseDownloading {
-		if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseDownloading, 0,
-			"Download in progress"); err != nil {
-			logger.Error(err, "failed to update download status")
-		}
-	}
-
-	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+// getCacheDir returns the cache directory for a model
+func (r *InferenceModelReconciler) getCacheDir(modelName string) string {
+	return filepath.Join("/models", modelName)
 }
 
-// getVerifyJobName returns the name for the verification job
-func getVerifyJobName(model *inferencev1alpha1.InferenceModel) string {
-	return model.Name + "-verify-ready"
+// transitionToDeploying transitions the model to the deploying phase
+func (r *InferenceModelReconciler) transitionToDeploying(ctx context.Context, model *inferencev1alpha1.InferenceModel) (ctrl.Result, error) {
+	// Update status and move to next phase
+	model.Status.Phase = "Deploying"
+	if err := r.Status().Update(ctx, model); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
 }
 
-// verifyReadyFileAndComplete verifies the .ready file exists before marking download as complete
-func (r *InferenceModelReconciler) verifyReadyFileAndComplete(ctx context.Context, model *inferencev1alpha1.InferenceModel, downloadJob *batchv1.Job) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	// Get the PVC name from the download job
-	pvcName := ""
-	for _, volume := range downloadJob.Spec.Template.Spec.Volumes {
-		if volume.Name == "model-cache" && volume.PersistentVolumeClaim != nil {
-			pvcName = volume.PersistentVolumeClaim.ClaimName
-			break
-		}
+// convertDownloadPhase converts download.DownloadPhase to inferencev1alpha1.DownloadPhase
+func convertDownloadPhase(p download.DownloadPhase) inferencev1alpha1.DownloadPhase {
+	switch p {
+	case download.PhasePending:
+		return inferencev1alpha1.DownloadPhasePending
+	case download.PhaseDownloading:
+		return inferencev1alpha1.DownloadPhaseDownloading
+	case download.PhaseComplete:
+		return inferencev1alpha1.DownloadPhaseComplete
+	case download.PhaseFailed:
+		return inferencev1alpha1.DownloadPhaseFailed
+	default:
+		return inferencev1alpha1.DownloadPhasePending
 	}
-	if pvcName == "" {
-		logger.Error(nil, "could not find PVC name from download job")
-		return ctrl.Result{}, fmt.Errorf("could not find PVC name from download job")
-	}
-
-	// Check if verification job already exists
-	verifyJobName := getVerifyJobName(model)
-	existingVerifyJob := &batchv1.Job{}
-	err := r.Get(ctx, client.ObjectKey{Name: verifyJobName, Namespace: model.Namespace}, existingVerifyJob)
-	if err == nil {
-		// Verification job exists, check its status
-		return r.checkVerifyJobStatus(ctx, model, existingVerifyJob)
-	}
-	if !errors.IsNotFound(err) {
-		logger.Error(err, "failed to check verification job")
-		return ctrl.Result{}, fmt.Errorf("failed to check verification job: %w", err)
-	}
-
-	// Create verification job
-	modelDir := getModelDir(model)
-	verifyCmd := fmt.Sprintf("if [ -f %s/.ready ]; then echo 'Ready file exists'; exit 0; else echo 'Ready file not found'; exit 1; fi", modelDir)
-
-	verifyJob := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      verifyJobName,
-			Namespace: model.Namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      model.Name,
-				"app.kubernetes.io/component": "model-verify",
-				"inference.eh-ops.io/model":   model.Spec.ModelName,
-				"inference.eh-ops.io/managed": "true",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:    "verify",
-							Image:   "busybox:latest",
-							Command: []string{"sh", "-c", verifyCmd},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "model-cache",
-									MountPath: "/models",
-								},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "model-cache",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: pvcName,
-								},
-							},
-						},
-					},
-					RestartPolicy: corev1.RestartPolicyOnFailure,
-				},
-			},
-		},
-	}
-
-	// Set owner reference
-	if err := controllerutil.SetControllerReference(model, verifyJob, r.Scheme); err != nil {
-		logger.Error(err, "failed to set controller reference on verification job")
-		return ctrl.Result{}, fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	// Create the verification job
-	if err := r.Create(ctx, verifyJob); err != nil {
-		if errors.IsAlreadyExists(err) {
-			logger.Info("Verification job already exists, requeuing")
-			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
-		}
-		logger.Error(err, "failed to create verification job")
-		return ctrl.Result{}, fmt.Errorf("failed to create verification job: %w", err)
-	}
-
-	logger.Info("Created verification job to check .ready file", "model", model.Name, "job", verifyJobName)
-
-	// Update status to indicate verification is in progress
-	if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseDownloading, 99,
-		"Verifying download completeness"); err != nil {
-		logger.Error(err, "failed to update download status")
-	}
-
-	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 }
 
-// checkVerifyJobStatus checks the status of a verification job and completes the download if successful
-func (r *InferenceModelReconciler) checkVerifyJobStatus(ctx context.Context, model *inferencev1alpha1.InferenceModel, verifyJob *batchv1.Job) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	// Check job conditions
-	for _, condition := range verifyJob.Status.Conditions {
-		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			// Verification succeeded, .ready file exists
-			logger.Info("Verification job completed, .ready file verified", "model", model.Name)
-
-			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseComplete, 100,
-				"Model download completed and verified"); err != nil {
-				logger.Error(err, "failed to update download status")
-				return ctrl.Result{}, err
-			}
-
-			r.Recorder.Event(model, corev1.EventTypeNormal, "DownloadComplete",
-				"Model download completed successfully, .ready file verified")
-
-			// Clean up the verification job
-			if err := r.Delete(ctx, verifyJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-				logger.Error(err, "failed to delete verification job", "job", verifyJob.Name)
-			}
-
-			// Requeue to proceed with deployment creation
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			// Verification failed, .ready file does not exist
-			logger.Info("Verification job failed, .ready file not found", "model", model.Name, "reason", condition.Reason, "message", condition.Message)
-
-			if err := r.updateDownloadStatus(ctx, model, inferencev1alpha1.DownloadPhaseFailed, 0,
-				fmt.Sprintf("Download verification failed: .ready file not found. %s", condition.Message)); err != nil {
-				logger.Error(err, "failed to update download status")
-				return ctrl.Result{}, err
-			}
-
-			r.Recorder.Event(model, corev1.EventTypeWarning, "DownloadFailed",
-				"Model download verification failed: .ready file not found")
-
-			// Clean up the verification job
-			if err := r.Delete(ctx, verifyJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-				logger.Error(err, "failed to delete verification job", "job", verifyJob.Name)
-			}
-
-			return ctrl.Result{}, nil
-		}
+// formatDuration formats a duration for human-readable display
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return ""
 	}
 
-	// Verification job is still running
-	logger.V(1).Info("Verification job still running", "model", model.Name)
-	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh%dm%ds", h, m, s)
+	case m > 0:
+		return fmt.Sprintf("%dm%ds", m, s)
+	default:
+		return fmt.Sprintf("%ds", s)
+	}
 }
 
-// getCleanupJobName returns the name for the cleanup job
-func getCleanupJobName(model *inferencev1alpha1.InferenceModel) string {
-	return model.Name + "-cleanup"
-}
-
-// createCleanupJob creates a job to clean up model files from a shared PVC
-func (r *InferenceModelReconciler) createCleanupJob(ctx context.Context, model *inferencev1alpha1.InferenceModel) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	storage := model.Spec.Storage
-
-	// Determine the PVC name
-	pvcName := storage.PVC
-	if pvcName == "" {
-		pvcName = model.Name + "-models"
+// getProgressSnapshot gets a progress snapshot from the download status
+// This is a helper to get ETA information
+func (r *InferenceModelReconciler) getProgressSnapshot(status *download.Status) download.ProgressSnapshot {
+	// Create a basic snapshot from the status
+	// Note: For more accurate ETA, the download package would need to expose
+	// the ProgressTracker's Snapshot method
+	return download.ProgressSnapshot{
+		BytesCompleted: status.BytesDone,
+		BytesTotal:     status.BytesTotal,
+		Percentage:     status.Progress,
+		Elapsed:        status.Duration(),
 	}
-
-	// Get the model directory to clean up
-	modelDir := getModelDir(model)
-
-	// Check if cleanup job already exists
-	jobName := getCleanupJobName(model)
-	existingJob := &batchv1.Job{}
-	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: model.Namespace}, existingJob)
-	if err == nil {
-		// Job exists, check its status
-		for _, condition := range existingJob.Status.Conditions {
-			if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-				logger.Info("Cleanup job already completed", "model", model.Name, "job", jobName)
-				// Delete the completed job
-				if err := r.Delete(ctx, existingJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-					logger.Error(err, "failed to delete completed cleanup job")
-				}
-				return ctrl.Result{}, nil
-			}
-			if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-				logger.Info("Cleanup job failed, continuing with deletion", "model", model.Name, "job", jobName, "message", condition.Message)
-				return ctrl.Result{}, nil
-			}
-		}
-		// Job is still running, wait for it
-		logger.Info("Cleanup job still running", "model", model.Name, "job", jobName)
-		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
-	}
-
-	if !errors.IsNotFound(err) {
-		logger.Error(err, "failed to check cleanup job")
-		return ctrl.Result{}, fmt.Errorf("failed to check cleanup job: %w", err)
-	}
-
-	// Build the cleanup job
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: model.Namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      model.Name,
-				"app.kubernetes.io/component": "model-cleanup",
-				"inference.eh-ops.io/model":   model.Spec.ModelName,
-				"inference.eh-ops.io/managed": "true",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:    "cleanup",
-							Image:   "alpine:3.19",
-							Command: []string{"sh", "-c", fmt.Sprintf("rm -rf %s", modelDir)},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "model-cache",
-									MountPath: "/models",
-								},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "model-cache",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: pvcName,
-								},
-							},
-						},
-					},
-					RestartPolicy: corev1.RestartPolicyOnFailure,
-				},
-			},
-		},
-	}
-
-	// Set owner reference so the job is deleted when the model is deleted
-	if err := controllerutil.SetControllerReference(model, job, r.Scheme); err != nil {
-		logger.Error(err, "failed to set controller reference on cleanup job")
-		return ctrl.Result{}, fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	// Create the job
-	if err := r.Create(ctx, job); err != nil {
-		if errors.IsAlreadyExists(err) {
-			logger.Info("Cleanup job already exists, requeuing")
-			return ctrl.Result{Requeue: true}, nil
-		}
-		logger.Error(err, "failed to create cleanup job")
-		return ctrl.Result{}, fmt.Errorf("failed to create cleanup job: %w", err)
-	}
-
-	logger.Info("Created cleanup job for model",
-		"model", model.Name,
-		"pvc", pvcName,
-		"model_dir", modelDir,
-		"job", job.Name)
-
-	r.Recorder.Event(model, corev1.EventTypeNormal, "CleanupStarted",
-		fmt.Sprintf("Started cleanup job to remove model files from %s", modelDir))
-
-	// Wait for the job to complete
-	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
-}
-
-// updateDownloadStatus updates the download phase in the model status
-func (r *InferenceModelReconciler) updateDownloadStatus(ctx context.Context, model *inferencev1alpha1.InferenceModel,
-	phase inferencev1alpha1.DownloadPhase, progress int32, message string) error {
-
-	model.Status.DownloadPhase = phase
-	model.Status.DownloadProgress = progress
-	model.Status.DownloadMessage = message
-
-	// Set phase in status as well
-	model.Status.Phase = string(phase)
-
-	return r.Status().Update(ctx, model)
-}
-
-// ensurePVC ensures a PVC exists for model storage
-func (r *InferenceModelReconciler) ensurePVC(ctx context.Context, model *inferencev1alpha1.InferenceModel) (string, error) {
-	logger := log.FromContext(ctx)
-
-	storage := model.Spec.Storage
-
-	// If PVC is specified and create is false, just use the existing PVC
-	if storage.PVC != "" && !storage.Create {
-		return storage.PVC, nil
-	}
-
-	// If PVC name is specified for creation
-	pvcName := storage.PVC
-	if pvcName == "" {
-		pvcName = model.Name + "-models"
-	}
-
-	// Check if PVC already exists
-	existingPVC := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, client.ObjectKey{Name: pvcName, Namespace: model.Namespace}, existingPVC)
-	if err == nil {
-		// PVC exists
-		return pvcName, nil
-	}
-
-	if !errors.IsNotFound(err) {
-		return "", fmt.Errorf("failed to check PVC: %w", err)
-	}
-
-	// Create a new PVC if requested
-	if storage.Create || storage.PVC == "" {
-		// Default size if not specified
-		size := storage.Size
-		if size == "" {
-			size = "100Gi"
-		}
-
-		pvc := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      pvcName,
-				Namespace: model.Namespace,
-				Labels: map[string]string{
-					"app.kubernetes.io/name":      model.Name,
-					"app.kubernetes.io/component": "model-storage",
-					"inference.eh-ops.io/model":   model.Spec.ModelName,
-					"inference.eh-ops.io/managed": "true",
-				},
-			},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{
-					corev1.ReadWriteOnce,
-				},
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse(size),
-					},
-				},
-			},
-		}
-
-		// Set storage class if specified
-		if storage.StorageClass != "" {
-			pvc.Spec.StorageClassName = &storage.StorageClass
-		}
-
-		// Set owner reference
-		if err := controllerutil.SetControllerReference(model, pvc, r.Scheme); err != nil {
-			return "", fmt.Errorf("failed to set controller reference on PVC: %w", err)
-		}
-
-		if err := r.Create(ctx, pvc); err != nil {
-			if errors.IsAlreadyExists(err) {
-				return pvcName, nil
-			}
-			return "", fmt.Errorf("failed to create PVC: %w", err)
-		}
-
-		logger.Info("Created PVC for model storage", "pvc", pvcName, "size", size)
-		return pvcName, nil
-	}
-
-	// Use the specified PVC name (should exist)
-	return storage.PVC, nil
-}
-
-// getModelDir returns the directory path for the model within the PVC
-func getModelDir(model *inferencev1alpha1.InferenceModel) string {
-	modelDir := model.Spec.Storage.ModelDir
-	if modelDir == "" {
-		// Default to model name, replacing any slashes
-		modelDir = strings.ReplaceAll(model.Spec.ModelName, "/", "-")
-	}
-	return "/models/" + modelDir
-}
-
-// buildDownloadCommand builds the shell command for downloading the model
-func (r *InferenceModelReconciler) buildDownloadCommand(hf *inferencev1alpha1.HuggingFaceSource, modelDir string) string {
-	var cmd strings.Builder
-
-	// Install dependencies (include hf-xet for Xet storage support, requests for API verification)
-	cmd.WriteString("pip install huggingface_hub[cli] hf-transfer hf-xet requests && ")
-	cmd.WriteString("export HF_HUB_ENABLE_HF_TRANSFER=1 && ")
-
-	// Remove existing model directory AND any HuggingFace cache to ensure clean re-download
-	// The ~/.cache/huggingface directory can contain corrupted cached downloads
-	fmt.Fprintf(&cmd, "rm -rf %s && rm -rf /root/.cache/huggingface && ", modelDir)
-
-	// Create model directory
-	fmt.Fprintf(&cmd, "mkdir -p %s && ", modelDir)
-
-	// Build hf download command
-	fmt.Fprintf(&cmd, "hf download ${HF_REPO} --local-dir %s", modelDir)
-
-	// Add revision if specified
-	if hf.Revision != "" {
-		fmt.Fprintf(&cmd, " --revision %s", hf.Revision)
-	}
-
-	// Add include patterns for selective download
-	if len(hf.Files) > 0 {
-		cmd.WriteString(" --include ")
-		for i, file := range hf.Files {
-			if i > 0 {
-				cmd.WriteString(",")
-			}
-			cmd.WriteString(file)
-		}
-	}
-
-	// Verify file integrity using HuggingFace API checksums
-	// This fetches the expected SHA256 hashes from the HF API (lfs.oid for LFS files)
-	// and compares them against the downloaded files
-	cmd.WriteString(" && python3 -c \"")
-	cmd.WriteString("import os, hashlib, requests, json, sys; ")
-	cmd.WriteString("repo=os.environ.get('HF_REPO',''); ")
-	cmd.WriteString("rev='")
-	if hf.Revision != "" {
-		cmd.WriteString(hf.Revision)
-	} else {
-		cmd.WriteString("main")
-	}
-	cmd.WriteString("'; ")
-	cmd.WriteString("api_url=f'https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=True'; ")
-	cmd.WriteString("r=requests.get(api_url, timeout=30); r.raise_for_status(); ")
-	// For LFS files, use lfs.oid which is the SHA256 hash of the file content
-	cmd.WriteString("files={f['path']:f.get('lfs',{}).get('oid') for f in r.json() if f.get('lfs',{}).get('oid')}; ")
-	cmd.WriteString("base='")
-	cmd.WriteString(modelDir)
-	cmd.WriteString("'; ")
-	cmd.WriteString("errors=[]; ")
-	cmd.WriteString("[errors.append(f) for f,expected in files.items() if expected and os.path.exists(base+'/'+f) and hashlib.sha256(open(base+'/'+f,'rb').read()).hexdigest() != expected]; ")
-	cmd.WriteString("print(f'Verified {len(files)} files against HuggingFace checksums'); ")
-	cmd.WriteString("sys.exit(1) if errors else None\"")
-
-	// Validate GGUF files by checking magic bytes before marking as ready
-	// GGUF files start with "GGUF" magic bytes (0x47475546)
-	cmd.WriteString(" && ")
-	cmd.WriteString("for f in $(find ")
-	cmd.WriteString(modelDir)
-	cmd.WriteString(" -name '*.gguf' -type f); do ")
-	cmd.WriteString("if [ $(head -c 4 \"$f\" 2>/dev/null) != 'GGUF' ]; then ")
-	cmd.WriteString("echo \"ERROR: Invalid GGUF file: $f (corrupted or incomplete)\" >&2 && exit 1; ")
-	cmd.WriteString("fi; done")
-
-	// Create .ready file when complete
-	fmt.Fprintf(&cmd, " && touch %s/.ready", modelDir)
-
-	return cmd.String()
 }
 
 // buildResourceRequirements creates ResourceRequirements from the InferenceModel spec and InferenceBackend
@@ -1454,7 +883,6 @@ func (r *InferenceModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.InferenceModel{}).
 		Owns(&corev1.Pod{}).
-		Owns(&batchv1.Job{}).
 		Watches(
 			&inferencev1alpha1.InferenceBackend{},
 			handler.EnqueueRequestsFromMapFunc(r.findModelsForBackend),

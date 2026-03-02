@@ -71,26 +71,6 @@ rules:
       - list
       - watch
 
-  # Batch resources (for download jobs)
-  - apiGroups:
-      - batch
-    resources:
-      - jobs
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - batch
-    resources:
-      - jobs/status
-    verbs:
-      - get
-
   # Inference API resources
   - apiGroups:
       - inference.eh-ops.io

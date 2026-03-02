@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -34,6 +35,7 @@ import (
 	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/budget"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/controller"
+	"github.com/cecil-the-coder/inference-budget-controller/internal/download"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/metrics"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/proxy"
 	"github.com/cecil-the-coder/inference-budget-controller/internal/registry"
@@ -108,12 +110,34 @@ func main() {
 	// Initialize deployment registry
 	deploymentRegistry := registry.NewRegistry()
 
+	// Get HF token from secret or env
+	hfToken := os.Getenv("HF_TOKEN")
+
+	// Initialize DownloadManager
+	downloadMgr := download.NewManager(
+		download.WithHFToken(hfToken),
+		download.WithCacheDir("/models"),
+		download.WithMaxConcurrent(3),
+		download.WithBufferPoolSize(64*1024),
+	)
+
+	// Initialize CacheManager
+	cacheMgr := download.NewCacheManager(mgr.GetClient(),
+		download.WithCacheManagerDir("/models"),
+		download.WithTTL(24*time.Hour),
+		download.WithCleanupInterval(1*time.Hour),
+		download.WithNamespace("inference"),
+	)
+
 	if err = (&controller.InferenceModelReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("inferencemodel-controller"),
-		Metrics:  metricsCollector,
-		Registry: deploymentRegistry,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Recorder:        mgr.GetEventRecorderFor("inferencemodel-controller"),
+		Tracker:         budgetTracker,
+		Metrics:         metricsCollector,
+		Registry:        deploymentRegistry,
+		DownloadManager: downloadMgr,
+		CacheManager:    cacheMgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceModel")
 		os.Exit(1)
@@ -142,6 +166,12 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start cache cleanup in background
+	go func() {
+		setupLog.Info("starting cache cleanup manager", "cacheDir", "/models")
+		cacheMgr.Run(ctx)
+	}()
 
 	go func() {
 		setupLog.Info("starting proxy server", "address", proxyAddr)

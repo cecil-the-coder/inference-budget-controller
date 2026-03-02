@@ -19,6 +19,7 @@ package download
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -386,13 +387,28 @@ func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath
 			return 0, fmt.Errorf("failed to create destination directory: %w", err)
 		}
 
-		// Copy file
-		data, err := os.ReadFile(downloadedPath)
+		// Stream copy file using buffer pool (memory-efficient)
+		srcFile, err := os.Open(downloadedPath)
 		if err != nil {
-			return 0, fmt.Errorf("failed to read downloaded file: %w", err)
+			return 0, fmt.Errorf("failed to open downloaded file: %w", err)
 		}
-		if err := os.WriteFile(localPath, data, 0644); err != nil {
-			return 0, fmt.Errorf("failed to write file to destination: %w", err)
+		defer func() { _ = srcFile.Close() }()
+
+		dstFile, err := os.Create(localPath)
+		if err != nil {
+			return 0, fmt.Errorf("failed to create destination file: %w", err)
+		}
+		defer func() { _ = dstFile.Close() }()
+
+		buf := m.bufferPool.Get()
+		defer m.bufferPool.Put(buf)
+
+		if _, err := io.CopyBuffer(dstFile, srcFile, buf); err != nil {
+			return 0, fmt.Errorf("failed to copy file: %w", err)
+		}
+
+		if err := dstFile.Sync(); err != nil {
+			return 0, fmt.Errorf("failed to sync file: %w", err)
 		}
 	}
 

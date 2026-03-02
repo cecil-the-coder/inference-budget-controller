@@ -36,7 +36,7 @@ spec:
       labels:
         control-plane: controller-manager
     spec:
-      # Must run on same node as model-cache PVC (ReadWriteOnce)
+      # Single replica required for accurate budget tracking
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -44,16 +44,15 @@ spec:
                 matchLabels:
                   control-plane: controller-manager
               topologyKey: kubernetes.io/hostname
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                      - shadow
       securityContext:
         runAsNonRoot: true
+        # TODO(user): For common cases that do not require escalating privileges
+        # it is recommended to ensure that all your Pods/Containers are restrictive.
+        # More info: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        # Please uncomment the following code if your project does NOT have to work on old Kubernetes
+        # versions < 1.20 or on vendors versions which do NOT support this field by default (i.e. Openshift < 4.11 ).
+        # seccompProfile:
+        #   type: RuntimeDefault
       containers:
         - command:
             - /manager
@@ -87,12 +86,5 @@ spec:
             requests:
               cpu: 10m
               memory: 64Mi
-          volumeMounts:
-            - name: model-cache
-              mountPath: /models
-      volumes:
-        - name: model-cache
-          persistentVolumeClaim:
-            claimName: model-cache
       serviceAccountName: inference-budget-controller
       terminationGracePeriodSeconds: 10

@@ -631,7 +631,28 @@ func (s *Server) listModelsHandler(c *gin.Context) {
 
 // canScaleUp checks if there is enough memory budget to scale up a model
 func (s *Server) canScaleUp(ctx context.Context, model *inferencev1alpha1.InferenceModel) bool {
-	return s.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
+	// First check per-node budget from tracker
+	if !s.Tracker.CanAllocate(model.Name, model.Namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
+		return false
+	}
+
+	// If global memory limit is set, check against that too
+	if s.MaxMemoryBytes > 0 {
+		requestedMemory := resource.MustParse(model.Spec.Resources.Memory)
+		// Get total allocated memory across all nodes
+		totalAllocated := s.Tracker.GetTotalAllocatedMemory()
+		if totalAllocated+requestedMemory.Value() > s.MaxMemoryBytes {
+			logger := log.FromContext(ctx)
+			logger.Info("Global memory limit exceeded",
+				"requested", model.Spec.Resources.Memory,
+				"total_allocated", resource.NewQuantity(totalAllocated, resource.BinarySI).String(),
+				"max_memory", s.MaxModelMemory,
+			)
+			return false
+		}
+	}
+
+	return true
 }
 
 // handleInsufficientMemory handles the case when there's not enough memory.

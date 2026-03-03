@@ -252,6 +252,20 @@ func (t *Tracker) GetAllocation(name, namespace string) *ModelAllocation {
 	return nil
 }
 
+// GetTotalAllocatedMemory returns the total memory allocated across all models in bytes
+func (t *Tracker) GetTotalAllocatedMemory() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var total int64
+	for _, alloc := range t.allocations {
+		if alloc.Memory != nil {
+			total += alloc.Memory.Value()
+		}
+	}
+	return total
+}
+
 // GetBlockingModels returns models blocking allocation for the requested memory
 func (t *Tracker) GetBlockingModels(nodeSelector map[string]string, requestedMemory *resource.Quantity) []ModelAllocation {
 	t.mu.RLock()

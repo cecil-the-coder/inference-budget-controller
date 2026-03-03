@@ -788,6 +788,82 @@ func (s *Server) tryEvictIdleModels(ctx context.Context, requestedModel *inferen
 	return false
 }
 
+// tryEvictIdleModelsForGlobalLimit attempts to evict idle models to free memory for a new model
+// when the global memory limit would be exceeded. Returns true if enough memory was freed.
+func (s *Server) tryEvictIdleModelsForGlobalLimit(ctx context.Context, requestedModel *inferencev1alpha1.InferenceModel, requestedMemoryBytes int64) bool {
+	logger := log.FromContext(ctx)
+
+	if s.Registry == nil {
+		return false
+	}
+
+	// Get idle models sorted by last access (oldest first = LRU)
+	idleModels := s.Registry.GetIdleEntriesSorted(s.EvictionMinIdle)
+	if len(idleModels) == 0 {
+		logger.V(1).Info("No idle models available for eviction")
+		return false
+	}
+
+	freedMemory := int64(0)
+	neededMemory := requestedMemoryBytes - (s.MaxMemoryBytes - s.Tracker.GetTotalAllocatedMemory())
+
+	for _, entry := range idleModels {
+		// Skip if this is the model we're trying to create
+		if entry.Name == requestedModel.Name && entry.Namespace == requestedModel.Namespace {
+			continue
+		}
+
+		// Get model's memory allocation
+		alloc := s.Tracker.GetAllocation(entry.Name, entry.Namespace)
+		if alloc == nil || alloc.Memory == nil {
+			continue
+		}
+
+		idleTime := time.Since(entry.LastRequestTime)
+		logger.Info("Evicting idle model for global memory pressure",
+			"evicted_model", entry.Name,
+			"evicted_namespace", entry.Namespace,
+			"evicted_memory", alloc.Memory.String(),
+			"idle_time", idleTime.Round(time.Second),
+			"requested_model", requestedModel.Name,
+			"requested_memory", resource.NewQuantity(requestedMemoryBytes, resource.BinarySI).String(),
+		)
+
+		// Delete the pod
+		pod := &corev1.Pod{}
+		err := s.K8sClient.Get(ctx, client.ObjectKey{Name: entry.Name, Namespace: entry.Namespace}, pod)
+		if err == nil {
+			if err := s.K8sClient.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete pod during eviction", "pod", entry.Name)
+				continue
+			}
+		}
+
+		// Track freed memory
+		freedMemory += alloc.Memory.Value()
+
+		// Release memory budget
+		s.Tracker.ReleaseModel(entry.Name, entry.Namespace)
+
+		// Remove from registry
+		s.Registry.Delete(entry.Namespace, entry.Name)
+
+		// Check if we have freed enough memory
+		if freedMemory >= neededMemory {
+			logger.Info("Sufficient memory freed via eviction",
+				"freed_memory", resource.NewQuantity(freedMemory, resource.BinarySI).String(),
+				"needed_memory", resource.NewQuantity(neededMemory, resource.BinarySI).String())
+			return true
+		}
+	}
+
+	logger.Info("Insufficient memory freed via eviction",
+		"freed_memory", resource.NewQuantity(freedMemory, resource.BinarySI).String(),
+		"needed_memory", resource.NewQuantity(neededMemory, resource.BinarySI).String(),
+		"evicted_count", len(idleModels))
+	return freedMemory >= neededMemory
+}
+
 // triggerScaleUp triggers the creation of a pod for the model (legacy fallback)
 func (s *Server) triggerScaleUp(ctx context.Context, model *inferencev1alpha1.InferenceModel) error {
 	logger := log.FromContext(ctx)
@@ -1122,9 +1198,37 @@ func (s *Server) ensureDeployment(ctx context.Context, model *inferencev1alpha1.
 		return nil
 	}
 
-	// Check if we can allocate memory budget
+	// Check if we can allocate memory budget (per-node)
 	if !s.Tracker.CanAllocate(name, namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector) {
 		return fmt.Errorf("insufficient memory budget to create pod")
+	}
+
+	// Check global memory limit if configured
+	if s.MaxMemoryBytes > 0 {
+		requestedMemory := resource.MustParse(model.Spec.Resources.Memory)
+		totalAllocated := s.Tracker.GetTotalAllocatedMemory()
+		if totalAllocated+requestedMemory.Value() > s.MaxMemoryBytes {
+			logger.Info("Global memory limit exceeded, attempting eviction",
+				"requested", model.Spec.Resources.Memory,
+				"total_allocated", resource.NewQuantity(totalAllocated, resource.BinarySI).String(),
+				"max_memory", s.MaxModelMemory,
+			)
+
+			// Try to evict idle models to free memory
+			if s.tryEvictIdleModelsForGlobalLimit(ctx, model, requestedMemory.Value()) {
+				// Recheck after eviction
+				totalAllocated = s.Tracker.GetTotalAllocatedMemory()
+				if totalAllocated+requestedMemory.Value() > s.MaxMemoryBytes {
+					logger.Info("Still insufficient memory after eviction")
+					return fmt.Errorf("insufficient global memory: requested %s would exceed limit of %s",
+						model.Spec.Resources.Memory, s.MaxModelMemory)
+				}
+				logger.Info("Memory freed via eviction, proceeding with deployment")
+			} else {
+				return fmt.Errorf("insufficient global memory: requested %s would exceed limit of %s",
+					model.Spec.Resources.Memory, s.MaxModelMemory)
+			}
+		}
 	}
 
 	// Get the InferenceBackend CRD

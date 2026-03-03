@@ -187,7 +187,8 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 				}
 
 			case registry.StateReady:
-				// Pod is ready, proceed
+				// Pod is ready, ensure allocation is synced (in case of restart)
+				s.Tracker.SyncAllocation(modelName, namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
 				logger.V(1).Info("Pod already ready",
 					"namespace", namespace,
 					"model", modelName,
@@ -1207,6 +1208,12 @@ func (s *Server) ensureDeployment(ctx context.Context, model *inferencev1alpha1.
 	if s.MaxMemoryBytes > 0 {
 		requestedMemory := resource.MustParse(model.Spec.Resources.Memory)
 		totalAllocated := s.Tracker.GetTotalAllocatedMemory()
+		logger.Info("Checking global memory limit",
+			"requested", model.Spec.Resources.Memory,
+			"total_allocated", resource.NewQuantity(totalAllocated, resource.BinarySI).String(),
+			"max_memory", s.MaxModelMemory,
+			"would_exceed", totalAllocated+requestedMemory.Value() > s.MaxMemoryBytes,
+		)
 		if totalAllocated+requestedMemory.Value() > s.MaxMemoryBytes {
 			logger.Info("Global memory limit exceeded, attempting eviction",
 				"requested", model.Spec.Resources.Memory,
@@ -1337,6 +1344,8 @@ func (s *Server) waitForPodReady(ctx context.Context, model *inferencev1alpha1.I
 						"pod_ip", pod.Status.PodIP,
 					)
 					s.Registry.SetState(namespace, name, registry.StateReady)
+					// Ensure allocation is synced (in case another goroutine created the pod)
+					s.Tracker.SyncAllocation(name, namespace, model.Spec.Resources.Memory, model.Spec.NodeSelector)
 					return nil
 				}
 			}

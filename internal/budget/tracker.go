@@ -78,6 +78,38 @@ func NewTracker() *Tracker {
 	}
 }
 
+// SyncAllocation ensures an allocation exists for a model, creating it if necessary.
+// This is useful for syncing with existing running pods on startup.
+// Returns true if the allocation was created, false if it already existed.
+func (t *Tracker) SyncAllocation(name, namespace, memoryStr string, nodeSelector map[string]string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	key := modelKey(name, namespace)
+
+	// If already allocated, nothing to do
+	if _, exists := t.allocations[key]; exists {
+		return false
+	}
+
+	// Create the allocation
+	memory := resource.MustParse(memoryStr)
+	t.allocations[key] = &ModelAllocation{
+		Name:         name,
+		Namespace:    namespace,
+		Memory:       &memory,
+		NodeSelector: nodeSelector,
+	}
+
+	// Update node budget allocated count
+	nodeBudgetKey := nodeSelectorKey(nodeSelector)
+	if budget, ok := t.nodeBudgets[nodeBudgetKey]; ok {
+		budget.Allocated.Add(memory)
+	}
+
+	return true
+}
+
 // SetNodeBudget sets the total memory budget for a node pool
 func (t *Tracker) SetNodeBudget(nodeSelectorKey string, total resource.Quantity) {
 	t.mu.Lock()

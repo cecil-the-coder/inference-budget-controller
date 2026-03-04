@@ -224,7 +224,6 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 
 // needsDownload returns true if the model needs to be downloaded from HuggingFace.
-// It also clears stale download status if files are missing.
 func (r *InferenceModelReconciler) needsDownload(model *inferencev1alpha1.InferenceModel) bool {
 	// Check if HuggingFace source is configured
 	if model.Spec.Source.HuggingFace == nil {
@@ -233,13 +232,11 @@ func (r *InferenceModelReconciler) needsDownload(model *inferencev1alpha1.Infere
 
 	// If download is already complete, verify files actually exist
 	if model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseComplete {
-		// Verify the ready marker and files exist
 		cacheDir := filepath.Join("/models", model.Name)
 		if download.CheckAndVerifyReadyMarker(cacheDir) {
 			return false
 		}
-		// Files are missing or corrupted - clear stale download status so we can re-download
-		r.DownloadManager.RemoveStatus(model.Name)
+		// Files are missing or corrupted — needs re-download
 		return true
 	}
 
@@ -333,22 +330,32 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 		}
 	}
 
-	// Start download if not already running
-	if !r.DownloadManager.IsDownloading(model.Name) {
+	// Check existing download status first
+	status := r.DownloadManager.GetStatus(model.Name)
+
+	// If there's no status or it completed/failed, try to start a new download
+	if status == nil || status.IsComplete() {
+		// Clean up completed status before starting new download
+		if status != nil {
+			r.DownloadManager.RemoveStatus(model.Name)
+		}
+
 		logger.Info("Starting model download", "model", model.Name)
 		r.Recorder.Event(model, "Normal", "DownloadStarted", "Starting model download")
 
 		// Build download spec from model CRD
 		spec := r.buildDownloadSpec(model)
 
-		// Start download in goroutine
-		go func() {
-			_ = r.DownloadManager.Download(ctx, model.Name, spec)
-		}()
+		// Start download — Download() is non-blocking and uses LoadOrStore
+		// to prevent duplicate goroutines
+		if err := r.DownloadManager.Download(ctx, model.Name, spec); err != nil {
+			logger.V(1).Info("Download already in progress", "model", model.Name, "err", err)
+		}
+
+		// Re-fetch status after starting
+		status = r.DownloadManager.GetStatus(model.Name)
 	}
 
-	// Get current status
-	status := r.DownloadManager.GetStatus(model.Name)
 	if status == nil {
 		// Download not yet started, requeue
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil

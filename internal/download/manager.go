@@ -143,12 +143,6 @@ func NewManager(opts ...Option) *Manager {
 func (m *Manager) Download(ctx context.Context, modelName string, spec *DownloadSpec) error {
 	fmt.Printf("[download:%s] Download() called, repo=%s\n", modelName, spec.Repo)
 
-	// Check if already downloading
-	if _, exists := m.downloads.Load(modelName); exists {
-		fmt.Printf("[download:%s] Download already in progress\n", modelName)
-		return fmt.Errorf("download already in progress for model: %s", modelName)
-	}
-
 	// Create download status
 	status := &Status{
 		ModelName: modelName,
@@ -156,12 +150,17 @@ func (m *Manager) Download(ctx context.Context, modelName string, spec *Download
 		StartedAt: time.Now(),
 	}
 
+	// Atomically store only if no entry exists — prevents duplicate downloads
+	if existing, loaded := m.downloads.LoadOrStore(modelName, status); loaded {
+		existingStatus := existing.(*Status)
+		fmt.Printf("[download:%s] Download already tracked (phase=%s)\n", modelName, existingStatus.GetPhase())
+		return fmt.Errorf("download already tracked for model: %s (phase=%s)", modelName, existingStatus.GetPhase())
+	}
+
 	// Create cancellable context
 	dlCtx, cancel := context.WithCancel(context.Background())
 	status.SetCancelFunc(cancel)
 
-	// Store status
-	m.downloads.Store(modelName, status)
 	fmt.Printf("[download:%s] Status stored, starting goroutine\n", modelName)
 
 	// Start download in background

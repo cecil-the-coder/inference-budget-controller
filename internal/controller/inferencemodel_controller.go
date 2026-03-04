@@ -330,34 +330,23 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 		}
 	}
 
-	// Check existing download status first
+	// Check existing download status
 	status := r.DownloadManager.GetStatus(model.Name)
 
-	// If there's no status or it completed/failed, try to start a new download
-	if status == nil || status.IsComplete() {
-		// Clean up completed status before starting new download
-		if status != nil {
-			r.DownloadManager.RemoveStatus(model.Name)
-		}
-
+	// Start a new download only if nothing is tracked
+	if status == nil {
 		logger.Info("Starting model download", "model", model.Name)
 		r.Recorder.Event(model, "Normal", "DownloadStarted", "Starting model download")
 
-		// Build download spec from model CRD
 		spec := r.buildDownloadSpec(model)
-
-		// Start download — Download() is non-blocking and uses LoadOrStore
-		// to prevent duplicate goroutines
 		if err := r.DownloadManager.Download(ctx, model.Name, spec); err != nil {
 			logger.V(1).Info("Download already in progress", "model", model.Name, "err", err)
 		}
 
-		// Re-fetch status after starting
 		status = r.DownloadManager.GetStatus(model.Name)
 	}
 
 	if status == nil {
-		// Download not yet started, requeue
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
 
@@ -385,10 +374,11 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 		r.Recorder.Event(model, "Normal", "DownloadComplete",
 			fmt.Sprintf("Downloaded %d bytes in %s", status.BytesDone, status.Duration()))
 
-		// Write ready marker
+		// Write ready marker then clean up download status
 		if err := download.WriteReadyMarker(cacheDir); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to write ready marker: %w", err)
 		}
+		r.DownloadManager.RemoveStatus(model.Name)
 
 		return r.transitionToDeploying(ctx, model)
 
@@ -397,6 +387,7 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 		logger.Error(err, "Model download failed", "model", model.Name)
 		r.Recorder.Event(model, "Warning", "DownloadFailed", status.Error)
 		model.Status.DownloadError = status.Error
+		r.DownloadManager.RemoveStatus(model.Name)
 		return ctrl.Result{}, err
 
 	default:

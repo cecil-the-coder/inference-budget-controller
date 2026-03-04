@@ -20,10 +20,14 @@ package huggingface
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/gomlx/go-huggingface/hub"
 )
@@ -156,6 +160,15 @@ type FileInfo struct {
 
 	// Size is the file size in bytes (if available).
 	Size int64
+
+	// SHA256 is the SHA256 hash of the file (from LFS metadata, if available).
+	SHA256 string
+}
+
+// LFSInfo contains LFS metadata for a file.
+type LFSInfo struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 // ListFiles returns a list of files in the repository.
@@ -245,4 +258,98 @@ func (r *Repository) DownloadModel(ctx context.Context, patterns []string) (map[
 	}
 
 	return r.DownloadFiles(ctx, toDownload)
+}
+
+// hfAPIResponse represents the HuggingFace API response for model metadata.
+type hfAPIResponse struct {
+	Siblings []hfSibling `json:"siblings"`
+}
+
+type hfSibling struct {
+	Filename string   `json:"rfilename"`
+	LFS      *LFSInfo `json:"lfs,omitempty"`
+}
+
+// GetFileMetadata fetches file metadata including LFS SHA256 hashes from the HF API.
+func (c *Client) GetFileMetadata(ctx context.Context, repoID string) ([]FileInfo, error) {
+	url := fmt.Sprintf("https://huggingface.co/api/models/%s", repoID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	token := c.getToken()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch model metadata: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HF API returned status %d for repo %s", resp.StatusCode, repoID)
+	}
+
+	var apiResp hfAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, fmt.Errorf("failed to decode HF API response: %w", err)
+	}
+
+	var files []FileInfo
+	for _, s := range apiResp.Siblings {
+		fi := FileInfo{Name: s.Filename}
+		if s.LFS != nil {
+			fi.SHA256 = s.LFS.SHA256
+			fi.Size = s.LFS.Size
+		}
+		files = append(files, fi)
+	}
+	return files, nil
+}
+
+// ResumeDownloadFile downloads a file with Range header support for resuming partial downloads.
+// If offset > 0, sends a Range request starting from the given byte offset.
+// The response body is written to dest.
+func (c *Client) ResumeDownloadFile(ctx context.Context, repoID, filePath string, offset int64, dest io.Writer) (int64, error) {
+	url := fmt.Sprintf("https://huggingface.co/api/models/%s/resolve/main/%s", repoID, filePath)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	token := c.getToken()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+
+	client := &http.Client{Timeout: 0} // no timeout for large downloads
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 416 Range Not Satisfiable means offset is at or past end — file is already complete
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		return 0, nil
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return 0, fmt.Errorf("unexpected status %d downloading %s", resp.StatusCode, filePath)
+	}
+
+	written, err := io.Copy(dest, resp.Body)
+	if err != nil {
+		return written, fmt.Errorf("failed to write download data: %w", err)
+	}
+	return written, nil
 }

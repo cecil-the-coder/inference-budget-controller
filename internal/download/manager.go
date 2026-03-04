@@ -334,8 +334,42 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		status.SetProgress(downloadedBytes, totalBytes+int64(len(filesToDownload)-int(completedFiles))*1024*1024) // Estimate remaining
 	}
 
-	// Write manifest for verification before marking complete
+	// Fetch LFS metadata for SHA256 checksums
 	manifest := &FileManifest{Files: fileSizes}
+	logf("Fetching file metadata for SHA256 verification...")
+	fileMetadata, err := m.hfClient.GetFileMetadata(ctx, spec.Repo)
+	if err != nil {
+		logf("WARNING: failed to fetch file metadata (SHA256 verification skipped): %v", err)
+	} else {
+		checksums := make(map[string]string)
+		metaByName := make(map[string]string)
+		for _, fi := range fileMetadata {
+			if fi.SHA256 != "" {
+				metaByName[fi.Name] = fi.SHA256
+			}
+		}
+		for _, filePath := range filesToDownload {
+			if hash, ok := metaByName[filePath]; ok {
+				checksums[filePath] = hash
+			}
+		}
+		if len(checksums) > 0 {
+			manifest.Checksums = checksums
+			// Verify downloaded files against expected checksums
+			logf("Verifying SHA256 checksums for %d files...", len(checksums))
+			for filePath, expectedHash := range checksums {
+				localPath := filepath.Join(destDir, filePath)
+				if err := VerifyChecksum(localPath, expectedHash); err != nil {
+					logf("ERROR: SHA256 verification failed for %s: %v", filePath, err)
+					status.SetError(fmt.Sprintf("SHA256 verification failed for %s: %v", filePath, err))
+					return
+				}
+			}
+			logf("SHA256 verification passed for all files")
+		}
+	}
+
+	// Write manifest for verification before marking complete
 	if err := WriteManifest(destDir, manifest); err != nil {
 		logf("ERROR: failed to write manifest: %v", err)
 		status.SetError(fmt.Sprintf("failed to write manifest: %v", err))
@@ -432,7 +466,7 @@ func (m *Manager) shouldExclude(filePath string, excludePatterns []string) bool 
 	return false
 }
 
-// downloadFile downloads a single file, trying Xet first then falling back to regular download.
+// downloadFile downloads a single file, trying Xet first, then resume, then falling back to regular download.
 func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath, localPath string) (int64, error) {
 	// Parse namespace and repo name from the full repo path
 	parts := strings.SplitN(spec.Repo, "/", 2)
@@ -465,7 +499,12 @@ func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath
 		return info.Size(), nil
 	}
 
-	// Xet download failed, try regular HuggingFace download
+	// Check if a partial file exists and try to resume via Range request
+	if size, resumeErr := m.tryResumeDownload(ctx, spec.Repo, filePath, localPath); resumeErr == nil {
+		return size, nil
+	}
+
+	// Resume failed or not applicable, try regular HuggingFace download
 	repo, repoErr := m.hfClient.NewModelRepository(ctx, spec.Repo)
 	if repoErr != nil {
 		return 0, fmt.Errorf("xet download failed: %v, and failed to create repo handle: %w", err, repoErr)
@@ -515,6 +554,38 @@ func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath
 	}
 
 	return info.Size(), nil
+}
+
+// tryResumeDownload attempts to resume a partial download using HTTP Range headers.
+// Returns the final file size on success, or an error if resume is not possible.
+func (m *Manager) tryResumeDownload(ctx context.Context, repoID, filePath, localPath string) (int64, error) {
+	info, err := os.Stat(localPath)
+	if err != nil || info.Size() == 0 {
+		return 0, fmt.Errorf("no partial file to resume")
+	}
+
+	localSize := info.Size()
+	fmt.Printf("[download] Found partial file %s (%d bytes), attempting resume\n", filePath, localSize)
+
+	// Open the file for appending
+	f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open file for resume: %w", err)
+	}
+	defer f.Close()
+
+	written, err := m.hfClient.ResumeDownloadFile(ctx, repoID, filePath, localSize, f)
+	if err != nil {
+		return 0, fmt.Errorf("resume download failed: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return 0, fmt.Errorf("failed to sync resumed file: %w", err)
+	}
+
+	totalSize := localSize + written
+	fmt.Printf("[download] Resume complete for %s: %d bytes appended, total %d bytes\n", filePath, written, totalSize)
+	return totalSize, nil
 }
 
 // IsDownloading checks if a download is in progress for the given model.

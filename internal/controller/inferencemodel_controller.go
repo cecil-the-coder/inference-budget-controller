@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -301,12 +302,27 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 
 	// Check if model is already cached (ready marker exists AND files verify)
 	cacheDir := r.getCacheDir(model.Name)
-	if download.CheckAndVerifyReadyMarker(cacheDir) {
+	verifyResult := download.CheckAndVerifyReadyMarkerDetailed(cacheDir)
+	if verifyResult.Verified {
 		model.Status.DownloadPhase = inferencev1alpha1.DownloadPhaseComplete
 		if err := r.Status().Update(ctx, model); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.transitionToDeploying(ctx, model)
+	}
+
+	// Only clean HF cache when marker existed but verification failed (corruption),
+	// not on first download when there's no marker yet
+	if verifyResult.MarkerExists && model.Spec.Source.HuggingFace != nil {
+		repoID := model.Spec.Source.HuggingFace.Repo
+		hfHome := os.Getenv("HF_HOME")
+		if hfHome == "" {
+			hfHome = "/models" // default
+		}
+		logger.Info("Verification failed, cleaning HuggingFace cache", "repo", repoID, "error", verifyResult.Error)
+		if err := download.CleanHuggingFaceCache(hfHome, repoID); err != nil {
+			logger.Error(err, "Failed to clean HuggingFace cache", "repo", repoID)
+		}
 	}
 
 	// Start download if not already running

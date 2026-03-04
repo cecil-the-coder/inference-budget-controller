@@ -360,7 +360,7 @@ func (s *stallTimeoutReader) Close() {
 // The response body is written to dest. Includes stall detection — if no data is received
 // for 5 minutes, the download is cancelled and returns an error.
 func (c *Client) ResumeDownloadFile(ctx context.Context, repoID, filePath string, offset int64, dest io.Writer) (int64, error) {
-	url := fmt.Sprintf("https://huggingface.co/api/models/%s/resolve/main/%s", repoID, filePath)
+	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", repoID, filePath)
 
 	// Create a cancellable context for stall detection
 	dlCtx, cancel := context.WithCancel(ctx)

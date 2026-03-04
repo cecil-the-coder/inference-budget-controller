@@ -230,9 +230,15 @@ func needsDownload(model *inferencev1alpha1.InferenceModel) bool {
 		return false
 	}
 
-	// If download is already complete, no need to download again
+	// If download is already complete, verify files actually exist
 	if model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseComplete {
-		return false
+		// Verify the ready marker and files exist
+		cacheDir := filepath.Join("/models", model.Name)
+		if download.CheckAndVerifyReadyMarker(cacheDir) {
+			return false
+		}
+		// Files are missing or corrupted, need to re-download
+		return true
 	}
 
 	return true

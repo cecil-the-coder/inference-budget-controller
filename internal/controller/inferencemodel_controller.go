@@ -299,9 +299,9 @@ func (r *InferenceModelReconciler) removeFinalizer(ctx context.Context, model *i
 func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *inferencev1alpha1.InferenceModel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Check if model is already cached (ready marker exists)
+	// Check if model is already cached (ready marker exists AND files verify)
 	cacheDir := r.getCacheDir(model.Name)
-	if download.CheckReadyMarker(cacheDir) {
+	if download.CheckAndVerifyReadyMarker(cacheDir) {
 		model.Status.DownloadPhase = inferencev1alpha1.DownloadPhaseComplete
 		if err := r.Status().Update(ctx, model); err != nil {
 			return ctrl.Result{}, err

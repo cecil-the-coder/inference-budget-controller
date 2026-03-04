@@ -334,6 +334,14 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		status.SetProgress(downloadedBytes, totalBytes+int64(len(filesToDownload)-int(completedFiles))*1024*1024) // Estimate remaining
 	}
 
+	// Write manifest for verification before marking complete
+	manifest := &FileManifest{Files: fileSizes}
+	if err := WriteManifest(destDir, manifest); err != nil {
+		logf("ERROR: failed to write manifest: %v", err)
+		status.SetError(fmt.Sprintf("failed to write manifest: %v", err))
+		return
+	}
+
 	// Mark as complete
 	status.SetProgress(totalBytes, totalBytes)
 	status.SetComplete()

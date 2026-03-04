@@ -1520,6 +1520,12 @@ func buildContainerEnv(model *inferencev1alpha1.InferenceModel, backend *inferen
 		{Name: "BACKEND_URL", Value: fmt.Sprintf("http://localhost:%d", port)},
 		{Name: "PORT", Value: fmt.Sprintf("%d", port)},
 	}
+	if model.Spec.Source.HuggingFace != nil && model.Spec.Source.HuggingFace.ContextSize != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "CONTEXT_SIZE",
+			Value: model.Spec.Source.HuggingFace.ContextSize,
+		})
+	}
 	envVars = append(envVars, backend.Spec.Env...)
 	envVars = append(envVars, model.Spec.Env...)
 	return envVars
@@ -1603,6 +1609,12 @@ func buildContainerArgs(model *inferencev1alpha1.InferenceModel, backend *infere
 			args[i] = strings.ReplaceAll(arg, "$(MMPROJ_SOURCE)", paths.mmprojSource)
 		}
 	}
+
+	// Append --ctx-size when contextSize is specified
+	if model.Spec.Source.HuggingFace != nil && model.Spec.Source.HuggingFace.ContextSize != "" {
+		args = append(args, "--ctx-size", model.Spec.Source.HuggingFace.ContextSize)
+	}
+
 	return args
 }
 

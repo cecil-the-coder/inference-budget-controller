@@ -308,8 +308,14 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 			}
 		}()
 
+		// Create progress callback for chunked downloads
+		onProgress := func(bytesDone int64) {
+			status.UpdateFileProgress(filePath, bytesDone, 0, PhaseDownloading)
+			logf("Progress: %s - %.1f MB downloaded", filePath, float64(bytesDone)/1024/1024)
+		}
+
 		// Try Xet download first, fall back to regular download
-		downloadedSize, err := m.downloadFile(ctx, spec, filePath, localPath)
+		downloadedSize, err := m.downloadFile(ctx, spec, filePath, localPath, onProgress)
 
 		// Stop progress monitoring
 		progressCancel()
@@ -470,7 +476,7 @@ func (m *Manager) shouldExclude(filePath string, excludePatterns []string) bool 
 }
 
 // downloadFile downloads a single file, trying Xet first, then resume, then falling back to regular download.
-func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath, localPath string) (int64, error) {
+func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath, localPath string, onProgress ProgressFunc) (int64, error) {
 	// Parse namespace and repo name from the full repo path
 	parts := strings.SplitN(spec.Repo, "/", 2)
 	namespace := parts[0]
@@ -503,7 +509,7 @@ func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath
 	}
 
 	// Try chunked multipart download for large files with Range support
-	size, chunkedErr := m.chunkedDownloader.Download(ctx, spec.Repo, filePath, localPath, nil)
+	size, chunkedErr := m.chunkedDownloader.Download(ctx, spec.Repo, filePath, localPath, onProgress)
 	if chunkedErr == nil {
 		return size, nil
 	}

@@ -18,6 +18,7 @@ package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,14 +38,15 @@ const DefaultMaxConcurrent = 3
 
 // Manager handles concurrent model downloads with proper resource management.
 type Manager struct {
-	client        client.Client
-	hfClient      *huggingface.Client
-	xetDownloader *xet.Downloader
-	cacheDir      string
-	maxConcurrent int
-	semaphore     chan struct{}
-	downloads     sync.Map // modelName -> *Status
-	bufferPool    *BufferPool
+	client             client.Client
+	hfClient           *huggingface.Client
+	xetDownloader      *xet.Downloader
+	chunkedDownloader  *chunkedDownloader
+	cacheDir           string
+	maxConcurrent      int
+	semaphore          chan struct{}
+	downloads          sync.Map // modelName -> *Status
+	bufferPool         *BufferPool
 }
 
 // Option is a functional option for configuring the Manager.
@@ -132,6 +134,9 @@ func NewManager(opts ...Option) *Manager {
 		xetClient := xet.NewClient()
 		m.xetDownloader = xet.NewDownloader(xetClient)
 	}
+
+	// Initialize chunked downloader
+	m.chunkedDownloader = newChunkedDownloader(m.hfClient, m.bufferPool)
 
 	return m
 }
@@ -495,6 +500,15 @@ func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath
 			return 0, fmt.Errorf("failed to stat downloaded file: %w", statErr)
 		}
 		return info.Size(), nil
+	}
+
+	// Try chunked multipart download for large files with Range support
+	size, chunkedErr := m.chunkedDownloader.Download(ctx, spec.Repo, filePath, localPath, nil)
+	if chunkedErr == nil {
+		return size, nil
+	}
+	if !errors.Is(chunkedErr, ErrRangeNotSupported) {
+		fmt.Printf("[download] Chunked download failed for %s: %v, falling back\n", filePath, chunkedErr)
 	}
 
 	// Download directly via HTTP with Range support and stall detection.

@@ -312,17 +312,19 @@ func (c *Client) GetFileMetadata(ctx context.Context, repoID string) ([]FileInfo
 	return files, nil
 }
 
-// stallTimeoutReader wraps an io.Reader and cancels a context if no data is
+// StallTimeoutReader wraps an io.Reader and cancels a context if no data is
 // read for the specified duration. This detects stalled HTTP connections.
-type stallTimeoutReader struct {
+type StallTimeoutReader struct {
 	r       io.Reader
 	cancel  context.CancelFunc
 	timeout time.Duration
 	timer   *time.Timer
 }
 
-func newStallTimeoutReader(r io.Reader, cancel context.CancelFunc, timeout time.Duration) *stallTimeoutReader {
-	s := &stallTimeoutReader{
+// NewStallTimeoutReader creates a reader that cancels the given cancel func
+// if no data is read for the specified timeout duration.
+func NewStallTimeoutReader(r io.Reader, cancel context.CancelFunc, timeout time.Duration) *StallTimeoutReader {
+	s := &StallTimeoutReader{
 		r:       r,
 		cancel:  cancel,
 		timeout: timeout,
@@ -336,7 +338,7 @@ func newStallTimeoutReader(r io.Reader, cancel context.CancelFunc, timeout time.
 	return s
 }
 
-func (s *stallTimeoutReader) Read(p []byte) (int, error) {
+func (s *StallTimeoutReader) Read(p []byte) (int, error) {
 	n, err := s.r.Read(p)
 	if n > 0 {
 		// Data was read — reset the stall timer
@@ -351,8 +353,25 @@ func (s *stallTimeoutReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *stallTimeoutReader) Close() {
+func (s *StallTimeoutReader) Close() {
 	s.timer.Stop()
+}
+
+// NewAuthenticatedRequest creates an HTTP request with the HF Bearer token set.
+func (c *Client) NewAuthenticatedRequest(ctx context.Context, method, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token := c.getToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req, nil
+}
+
+// ResolveDownloadURL returns the HuggingFace resolve URL for a file in a repo.
+func ResolveDownloadURL(repoID, filePath string) string {
+	return fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", repoID, filePath)
 }
 
 // ResumeDownloadFile downloads a file with Range header support for resuming partial downloads.
@@ -396,7 +415,7 @@ func (c *Client) ResumeDownloadFile(ctx context.Context, repoID, filePath string
 	}
 
 	// Wrap response body with stall detection (5 minute timeout)
-	stallReader := newStallTimeoutReader(resp.Body, cancel, 5*time.Minute)
+	stallReader := NewStallTimeoutReader(resp.Body, cancel, 5*time.Minute)
 	defer stallReader.Close()
 
 	written, err := io.Copy(dest, stallReader)

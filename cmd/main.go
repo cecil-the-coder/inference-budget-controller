@@ -26,6 +26,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	metricsClient "k8s.io/metrics/pkg/client/clientset/versioned"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -138,6 +139,13 @@ func main() {
 		download.WithNamespace("inference"),
 	)
 
+	// Create metrics clientset for querying pod metrics from metrics-server
+	metricsCS, err := metricsClient.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create metrics clientset")
+		os.Exit(1)
+	}
+
 	if err = (&controller.InferenceModelReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
@@ -147,6 +155,7 @@ func main() {
 		Registry:        deploymentRegistry,
 		DownloadManager: downloadMgr,
 		CacheManager:    cacheMgr,
+		MetricsClient:   metricsCS.MetricsV1beta1(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceModel")
 		os.Exit(1)

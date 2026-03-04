@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	metricsv "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -93,6 +94,7 @@ type InferenceModelReconciler struct {
 	Registry        *registry.DeploymentRegistry
 	DownloadManager *download.Manager
 	CacheManager    *download.CacheManager
+	MetricsClient   metricsv.MetricsV1beta1Interface
 }
 
 //+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencemodels,verbs=get;list;watch;create;update;patch;delete
@@ -103,6 +105,7 @@ type InferenceModelReconciler struct {
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -671,6 +674,21 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 
 	// Set declared memory in status
 	model.Status.DeclaredMemory = model.Spec.Resources.Memory
+
+	// Query pod metrics from metrics-server and record observed memory usage
+	if ready && r.MetricsClient != nil {
+		podMetrics, err := r.MetricsClient.PodMetricses(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		if err == nil {
+			for _, c := range podMetrics.Containers {
+				if mem, ok := c.Usage[corev1.ResourceMemory]; ok {
+					r.Tracker.RecordUsage(model.Name, model.Namespace, &mem)
+					break
+				}
+			}
+		} else {
+			logger.V(1).Info("Failed to get pod metrics", "pod", pod.Name, "error", err)
+		}
+	}
 
 	// Get utilization info from tracker and update status
 	utilizationInfo := r.Tracker.GetUtilization(model.Name, model.Namespace, model.Spec.Resources.Memory)

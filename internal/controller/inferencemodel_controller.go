@@ -191,7 +191,8 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// The proxy will create the pod when a request comes in
 			r.Registry.SetState(model.Namespace, model.Name, registry.StateNonexistent)
 
-			// Update status to reflect no pod exists
+			// Update status to reflect no pod exists (scaled to zero)
+			model.Status.Phase = "ScaledToZero"
 			model.Status.Ready = false
 			model.Status.Replicas = 0
 			model.Status.AvailableReplicas = 0
@@ -199,9 +200,9 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				logger.Error(err, "failed to update status for nonexistent pod")
 			}
 
-			// Update condition to indicate waiting
-			if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionFalse,
-				ReasonDeploying, "Waiting for first request to create pod"); err != nil {
+			// Model is in its desired state (scaled to zero, waiting for on-demand creation)
+			if err := r.setCondition(ctx, model, ConditionTypeReady, metav1.ConditionTrue,
+				ReasonScaledToZero, "Scaled to zero, waiting for first request"); err != nil {
 				logger.Error(err, "failed to update status condition")
 			}
 

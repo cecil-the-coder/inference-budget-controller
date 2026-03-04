@@ -381,7 +381,10 @@ func TestChunkedDownloadRetryOnError(t *testing.T) {
 		// Parse range
 		rangeHeader := r.Header.Get("Range")
 		var start, end int64
-		fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
 		if end >= int64(dataSize) {
 			end = int64(dataSize) - 1
 		}

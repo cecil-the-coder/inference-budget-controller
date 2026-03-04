@@ -38,15 +38,15 @@ const DefaultMaxConcurrent = 3
 
 // Manager handles concurrent model downloads with proper resource management.
 type Manager struct {
-	client             client.Client
-	hfClient           *huggingface.Client
-	xetDownloader      *xet.Downloader
-	chunkedDownloader  *chunkedDownloader
-	cacheDir           string
-	maxConcurrent      int
-	semaphore          chan struct{}
-	downloads          sync.Map // modelName -> *Status
-	bufferPool         *BufferPool
+	client            client.Client
+	hfClient          *huggingface.Client
+	xetDownloader     *xet.Downloader
+	chunkedDownloader *chunkedDownloader
+	cacheDir          string
+	maxConcurrent     int
+	semaphore         chan struct{}
+	downloads         sync.Map // modelName -> *Status
+	bufferPool        *BufferPool
 }
 
 // Option is a functional option for configuring the Manager.

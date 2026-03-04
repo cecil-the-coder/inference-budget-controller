@@ -115,6 +115,27 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 
 		logger = logger.WithValues("inferenceModel", model.Name, "namespace", model.Namespace)
 
+		// Check if model is still downloading
+		if model.Status.DownloadPhase != "" && model.Status.DownloadPhase != "Complete" {
+			progress := model.Status.DownloadProgress
+			message := fmt.Sprintf("Model is still downloading (%d%% complete)", progress)
+			if model.Status.DownloadBytesTotal > 0 {
+				doneGB := float64(model.Status.DownloadBytesDone) / (1024 * 1024 * 1024)
+				totalGB := float64(model.Status.DownloadBytesTotal) / (1024 * 1024 * 1024)
+				message = fmt.Sprintf("Model is still downloading (%.1f%% - %.1fGB/%.1fGB)",
+					float64(progress), doneGB, totalGB)
+			}
+			logger.Info("Model still downloading, rejecting request", "phase", model.Status.DownloadPhase)
+			c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+				Error: ErrorDetail{
+					Message: message,
+					Type:    "server_error",
+					Code:    "model_downloading",
+				},
+			})
+			return
+		}
+
 		// Log with structured fields including memory info
 		logger.Info("Processing inference request",
 			"model", req.Model,

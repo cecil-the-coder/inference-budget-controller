@@ -312,13 +312,61 @@ func (c *Client) GetFileMetadata(ctx context.Context, repoID string) ([]FileInfo
 	return files, nil
 }
 
+// stallTimeoutReader wraps an io.Reader and cancels a context if no data is
+// read for the specified duration. This detects stalled HTTP connections.
+type stallTimeoutReader struct {
+	r       io.Reader
+	cancel  context.CancelFunc
+	timeout time.Duration
+	timer   *time.Timer
+}
+
+func newStallTimeoutReader(r io.Reader, cancel context.CancelFunc, timeout time.Duration) *stallTimeoutReader {
+	s := &stallTimeoutReader{
+		r:       r,
+		cancel:  cancel,
+		timeout: timeout,
+		timer:   time.NewTimer(timeout),
+	}
+	go func() {
+		<-s.timer.C
+		fmt.Printf("[download] Stall timeout (%s) exceeded, cancelling download\n", timeout)
+		cancel()
+	}()
+	return s
+}
+
+func (s *stallTimeoutReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		// Data was read — reset the stall timer
+		if !s.timer.Stop() {
+			select {
+			case <-s.timer.C:
+			default:
+			}
+		}
+		s.timer.Reset(s.timeout)
+	}
+	return n, err
+}
+
+func (s *stallTimeoutReader) Close() {
+	s.timer.Stop()
+}
+
 // ResumeDownloadFile downloads a file with Range header support for resuming partial downloads.
 // If offset > 0, sends a Range request starting from the given byte offset.
-// The response body is written to dest.
+// The response body is written to dest. Includes stall detection — if no data is received
+// for 5 minutes, the download is cancelled and returns an error.
 func (c *Client) ResumeDownloadFile(ctx context.Context, repoID, filePath string, offset int64, dest io.Writer) (int64, error) {
 	url := fmt.Sprintf("https://huggingface.co/api/models/%s/resolve/main/%s", repoID, filePath)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// Create a cancellable context for stall detection
+	dlCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(dlCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -331,7 +379,7 @@ func (c *Client) ResumeDownloadFile(ctx context.Context, repoID, filePath string
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
-	client := &http.Client{Timeout: 0} // no timeout for large downloads
+	client := &http.Client{Timeout: 0} // no overall timeout — stall detection handles hangs
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("failed to download file: %w", err)
@@ -347,9 +395,13 @@ func (c *Client) ResumeDownloadFile(ctx context.Context, repoID, filePath string
 		return 0, fmt.Errorf("unexpected status %d downloading %s", resp.StatusCode, filePath)
 	}
 
-	written, err := io.Copy(dest, resp.Body)
+	// Wrap response body with stall detection (5 minute timeout)
+	stallReader := newStallTimeoutReader(resp.Body, cancel, 5*time.Minute)
+	defer stallReader.Close()
+
+	written, err := io.Copy(dest, stallReader)
 	if err != nil {
-		return written, fmt.Errorf("failed to write download data: %w", err)
+		return written, fmt.Errorf("failed to write download data (wrote %d bytes): %w", written, err)
 	}
 	return written, nil
 }

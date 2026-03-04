@@ -19,7 +19,6 @@ package download
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -498,61 +497,32 @@ func (m *Manager) downloadFile(ctx context.Context, spec *DownloadSpec, filePath
 		return info.Size(), nil
 	}
 
-	// Check if a partial file exists and try to resume via Range request
-	if size, resumeErr := m.tryResumeDownload(ctx, spec.Repo, filePath, localPath); resumeErr == nil {
+	// Download directly via HTTP with Range support and stall detection.
+	// This bypasses the HF library's cache (which downloads to its own dir first)
+	// and writes directly to localPath, enabling progress monitoring and resume.
+	size, dlErr := m.tryResumeDownload(ctx, spec.Repo, filePath, localPath)
+	if dlErr == nil {
 		return size, nil
 	}
 
-	// Resume failed or not applicable, try regular HuggingFace download
-	repo, repoErr := m.hfClient.NewModelRepository(ctx, spec.Repo)
-	if repoErr != nil {
-		return 0, fmt.Errorf("xet download failed: %v, and failed to create repo handle: %w", err, repoErr)
+	// Resume failed — try a fresh direct download (offset=0)
+	fmt.Printf("[download] Direct download for %s (resume failed: %v)\n", filePath, dlErr)
+	f, fErr := os.Create(localPath)
+	if fErr != nil {
+		return 0, fmt.Errorf("failed to create file %s: %w", localPath, fErr)
 	}
 
-	downloadedPath, err := repo.DownloadFile(ctx, filePath)
-	if err != nil {
-		return 0, fmt.Errorf("xet download failed: %v, and regular download failed: %w", err, err)
+	written, dlErr := m.hfClient.ResumeDownloadFile(ctx, spec.Repo, filePath, 0, f)
+	if syncErr := f.Sync(); syncErr != nil && dlErr == nil {
+		dlErr = fmt.Errorf("failed to sync file: %w", syncErr)
+	}
+	_ = f.Close()
+
+	if dlErr != nil {
+		return 0, fmt.Errorf("direct download failed for %s: %w", filePath, dlErr)
 	}
 
-	// Copy or move file to destination if needed
-	if downloadedPath != localPath {
-		// Ensure destination directory exists
-		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-			return 0, fmt.Errorf("failed to create destination directory: %w", err)
-		}
-
-		// Stream copy file using buffer pool (memory-efficient)
-		srcFile, err := os.Open(downloadedPath)
-		if err != nil {
-			return 0, fmt.Errorf("failed to open downloaded file: %w", err)
-		}
-		defer func() { _ = srcFile.Close() }()
-
-		dstFile, err := os.Create(localPath)
-		if err != nil {
-			return 0, fmt.Errorf("failed to create destination file: %w", err)
-		}
-		defer func() { _ = dstFile.Close() }()
-
-		buf := m.bufferPool.Get()
-		defer m.bufferPool.Put(buf)
-
-		if _, err := io.CopyBuffer(dstFile, srcFile, buf); err != nil {
-			return 0, fmt.Errorf("failed to copy file: %w", err)
-		}
-
-		if err := dstFile.Sync(); err != nil {
-			return 0, fmt.Errorf("failed to sync file: %w", err)
-		}
-	}
-
-	// Get file size
-	info, err := os.Stat(localPath)
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat downloaded file: %w", err)
-	}
-
-	return info.Size(), nil
+	return written, nil
 }
 
 // tryResumeDownload attempts to resume a partial download using HTTP Range headers.

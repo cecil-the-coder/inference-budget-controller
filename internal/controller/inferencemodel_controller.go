@@ -230,14 +230,11 @@ func (r *InferenceModelReconciler) needsDownload(model *inferencev1alpha1.Infere
 		return false
 	}
 
-	// If download is already complete, verify files actually exist
+	// If download is already complete, just check if the ready marker exists.
+	// Full verification is done in handleDownload which also handles cache cleanup.
 	if model.Status.DownloadPhase == inferencev1alpha1.DownloadPhaseComplete {
 		cacheDir := filepath.Join("/models", model.Name)
-		if download.CheckAndVerifyReadyMarker(cacheDir) {
-			return false
-		}
-		// Files are missing or corrupted — needs re-download
-		return true
+		return !download.CheckReadyMarker(cacheDir)
 	}
 
 	return true

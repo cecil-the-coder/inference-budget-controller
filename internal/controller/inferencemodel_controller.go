@@ -176,7 +176,7 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// Handle HuggingFace download if needed
-	if needsDownload(model) {
+	if r.needsDownload(model) {
 		return r.handleDownload(ctx, model)
 	}
 
@@ -223,8 +223,9 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return r.updateStatus(ctx, model, pod)
 }
 
-// needsDownload returns true if the model needs to be downloaded from HuggingFace
-func needsDownload(model *inferencev1alpha1.InferenceModel) bool {
+// needsDownload returns true if the model needs to be downloaded from HuggingFace.
+// It also clears stale download status if files are missing.
+func (r *InferenceModelReconciler) needsDownload(model *inferencev1alpha1.InferenceModel) bool {
 	// Check if HuggingFace source is configured
 	if model.Spec.Source.HuggingFace == nil {
 		return false
@@ -237,7 +238,8 @@ func needsDownload(model *inferencev1alpha1.InferenceModel) bool {
 		if download.CheckAndVerifyReadyMarker(cacheDir) {
 			return false
 		}
-		// Files are missing or corrupted, need to re-download
+		// Files are missing or corrupted - clear stale download status so we can re-download
+		r.DownloadManager.RemoveStatus(model.Name)
 		return true
 	}
 

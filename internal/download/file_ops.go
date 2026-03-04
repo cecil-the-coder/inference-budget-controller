@@ -240,7 +240,7 @@ func VerifyChecksum(filePath, expectedHash string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
@@ -287,7 +287,7 @@ func ComputeSHA256(filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
@@ -360,6 +360,13 @@ type ggufTensorInfo struct {
 	offset     uint64
 }
 
+// ggufHeader holds parsed GGUF file header fields.
+type ggufHeader struct {
+	version       uint32
+	tensorCount   uint64
+	metadataCount uint64
+}
+
 // validateGGUFHeader validates that a GGUF file has a valid header and that every
 // tensor's data fits within the file bounds. This catches the exact corruption pattern
 // of "tensor data not within file bounds".
@@ -368,129 +375,151 @@ func validateGGUFHeader(path string, actualSize int64) error {
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	r := bufio.NewReaderSize(file, 256*1024) // 256KB buffer for efficient reading
 
-	// Read magic number (4 bytes)
-	magic := make([]byte, 4)
-	if _, err := io.ReadFull(r, magic); err != nil {
-		return fmt.Errorf("failed to read magic: %w", err)
-	}
-	if string(magic) != ggufMagic {
-		return fmt.Errorf("invalid GGUF magic: got %q, expected %q", string(magic), ggufMagic)
-	}
-
-	// Read version (4 bytes, uint32)
-	var version uint32
-	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
-		return fmt.Errorf("failed to read version: %w", err)
-	}
-	if version < 2 || version > 4 {
-		return fmt.Errorf("unsupported GGUF version: %d (expected 2-4)", version)
-	}
-
-	// Read tensor count (8 bytes, uint64)
-	var tensorCount uint64
-	if err := binary.Read(r, binary.LittleEndian, &tensorCount); err != nil {
-		return fmt.Errorf("failed to read tensor count: %w", err)
-	}
-
-	// Read metadata KV count (8 bytes, uint64)
-	var metadataKVCount uint64
-	if err := binary.Read(r, binary.LittleEndian, &metadataKVCount); err != nil {
-		return fmt.Errorf("failed to read metadata count: %w", err)
-	}
-
-	// Sanity check counts
-	if tensorCount > 1_000_000 {
-		return fmt.Errorf("implausible tensor count: %d", tensorCount)
-	}
-	if metadataKVCount > 1_000_000 {
-		return fmt.Errorf("implausible metadata KV count: %d", metadataKVCount)
+	header, err := readGGUFFileHeader(r)
+	if err != nil {
+		return err
 	}
 
 	// Track bytes read so far: 4 (magic) + 4 (version) + 8 (tensors) + 8 (metadata) = 24
 	var bytesRead int64 = 24
 
-	// Parse metadata KV pairs to find general.alignment and advance past them
-	alignment := uint64(32) // default alignment
-	for i := uint64(0); i < metadataKVCount; i++ {
+	alignment, n, err := parseGGUFMetadata(r, header.metadataCount)
+	if err != nil {
+		return err
+	}
+	bytesRead += n
+
+	tensors, n, err := parseGGUFTensorInfos(r, header.tensorCount)
+	if err != nil {
+		return err
+	}
+	bytesRead += n
+
+	return validateGGUFTensorBounds(tensors, bytesRead, alignment, actualSize)
+}
+
+// readGGUFFileHeader reads and validates the GGUF magic, version, tensor count, and metadata count.
+func readGGUFFileHeader(r io.Reader) (ggufHeader, error) {
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(r, magic); err != nil {
+		return ggufHeader{}, fmt.Errorf("failed to read magic: %w", err)
+	}
+	if string(magic) != ggufMagic {
+		return ggufHeader{}, fmt.Errorf("invalid GGUF magic: got %q, expected %q", string(magic), ggufMagic)
+	}
+
+	var h ggufHeader
+	if err := binary.Read(r, binary.LittleEndian, &h.version); err != nil {
+		return ggufHeader{}, fmt.Errorf("failed to read version: %w", err)
+	}
+	if h.version < 2 || h.version > 4 {
+		return ggufHeader{}, fmt.Errorf("unsupported GGUF version: %d (expected 2-4)", h.version)
+	}
+
+	if err := binary.Read(r, binary.LittleEndian, &h.tensorCount); err != nil {
+		return ggufHeader{}, fmt.Errorf("failed to read tensor count: %w", err)
+	}
+	if err := binary.Read(r, binary.LittleEndian, &h.metadataCount); err != nil {
+		return ggufHeader{}, fmt.Errorf("failed to read metadata count: %w", err)
+	}
+
+	if h.tensorCount > 1_000_000 {
+		return ggufHeader{}, fmt.Errorf("implausible tensor count: %d", h.tensorCount)
+	}
+	if h.metadataCount > 1_000_000 {
+		return ggufHeader{}, fmt.Errorf("implausible metadata KV count: %d", h.metadataCount)
+	}
+
+	return h, nil
+}
+
+// parseGGUFMetadata parses all metadata KV pairs, extracting the alignment value.
+// Returns the alignment and total bytes consumed.
+func parseGGUFMetadata(r io.Reader, count uint64) (uint64, int64, error) {
+	alignment := uint64(32) // default
+	var bytesRead int64
+
+	for i := uint64(0); i < count; i++ {
 		key, n, err := readGGUFString(r)
 		if err != nil {
-			return fmt.Errorf("failed to read metadata key %d: %w", i, err)
+			return 0, bytesRead, fmt.Errorf("failed to read metadata key %d: %w", i, err)
 		}
 		bytesRead += n
 
-		// Read value type
 		var valueType uint32
 		if err := binary.Read(r, binary.LittleEndian, &valueType); err != nil {
-			return fmt.Errorf("failed to read metadata value type for key %q: %w", key, err)
+			return 0, bytesRead, fmt.Errorf("failed to read metadata value type for key %q: %w", key, err)
 		}
 		bytesRead += 4
 
-		// Check if this is general.alignment before skipping
 		if key == "general.alignment" {
 			val, n, err := readGGUFMetadataValue(r, valueType)
 			if err != nil {
-				return fmt.Errorf("failed to read alignment value: %w", err)
+				return 0, bytesRead, fmt.Errorf("failed to read alignment value: %w", err)
 			}
 			bytesRead += n
-			if alignVal, ok := val.(uint64); ok {
-				alignment = alignVal
-			} else if alignVal, ok := val.(uint32); ok {
-				alignment = uint64(alignVal)
+			switch v := val.(type) {
+			case uint64:
+				alignment = v
+			case uint32:
+				alignment = uint64(v)
 			}
 		} else {
 			n, err := skipGGUFMetadataValue(r, valueType)
 			if err != nil {
-				return fmt.Errorf("failed to skip metadata value for key %q (type %d): %w", key, valueType, err)
+				return 0, bytesRead, fmt.Errorf("failed to skip metadata value for key %q (type %d): %w", key, valueType, err)
 			}
 			bytesRead += n
 		}
 	}
 
-	// Parse tensor info entries
-	tensors := make([]ggufTensorInfo, tensorCount)
-	for i := uint64(0); i < tensorCount; i++ {
-		// Read tensor name
+	return alignment, bytesRead, nil
+}
+
+// parseGGUFTensorInfos parses tensor info entries from the GGUF file.
+// Returns the tensor infos and total bytes consumed.
+func parseGGUFTensorInfos(r io.Reader, count uint64) ([]ggufTensorInfo, int64, error) {
+	tensors := make([]ggufTensorInfo, count)
+	var bytesRead int64
+
+	for i := uint64(0); i < count; i++ {
 		name, n, err := readGGUFString(r)
 		if err != nil {
-			return fmt.Errorf("failed to read tensor %d name: %w", i, err)
+			return nil, bytesRead, fmt.Errorf("failed to read tensor %d name: %w", i, err)
 		}
 		bytesRead += n
 
-		// Read number of dimensions
 		var nDims uint32
 		if err := binary.Read(r, binary.LittleEndian, &nDims); err != nil {
-			return fmt.Errorf("failed to read tensor %d ndims: %w", i, err)
+			return nil, bytesRead, fmt.Errorf("failed to read tensor %d ndims: %w", i, err)
 		}
 		bytesRead += 4
 
 		if nDims > 8 {
-			return fmt.Errorf("tensor %q has implausible %d dimensions", name, nDims)
+			return nil, bytesRead, fmt.Errorf("tensor %q has implausible %d dimensions", name, nDims)
 		}
 
-		// Read dimensions
 		dims := make([]uint64, nDims)
 		for d := uint32(0); d < nDims; d++ {
 			if err := binary.Read(r, binary.LittleEndian, &dims[d]); err != nil {
-				return fmt.Errorf("failed to read tensor %q dimension %d: %w", name, d, err)
+				return nil, bytesRead, fmt.Errorf("failed to read tensor %q dimension %d: %w", name, d, err)
 			}
 			bytesRead += 8
 		}
 
-		// Read type
 		var typeID uint32
 		if err := binary.Read(r, binary.LittleEndian, &typeID); err != nil {
-			return fmt.Errorf("failed to read tensor %q type: %w", name, err)
+			return nil, bytesRead, fmt.Errorf("failed to read tensor %q type: %w", name, err)
 		}
 		bytesRead += 4
 
-		// Read offset
 		var offset uint64
 		if err := binary.Read(r, binary.LittleEndian, &offset); err != nil {
-			return fmt.Errorf("failed to read tensor %q offset: %w", name, err)
+			return nil, bytesRead, fmt.Errorf("failed to read tensor %q offset: %w", name, err)
 		}
 		bytesRead += 8
 
@@ -503,8 +532,12 @@ func validateGGUFHeader(path string, actualSize int64) error {
 		}
 	}
 
-	// Calculate tensor data section start (aligned)
-	tensorDataStart := bytesRead
+	return tensors, bytesRead, nil
+}
+
+// validateGGUFTensorBounds checks that every tensor's data fits within the file.
+func validateGGUFTensorBounds(tensors []ggufTensorInfo, headerSize int64, alignment uint64, fileSize int64) error {
+	tensorDataStart := headerSize
 	if alignment > 0 {
 		remainder := uint64(tensorDataStart) % alignment
 		if remainder != 0 {
@@ -512,7 +545,6 @@ func validateGGUFHeader(path string, actualSize int64) error {
 		}
 	}
 
-	// Validate each tensor's data fits within the file
 	for _, t := range tensors {
 		dataSize, err := computeTensorDataSize(t)
 		if err != nil {
@@ -520,9 +552,9 @@ func validateGGUFHeader(path string, actualSize int64) error {
 		}
 
 		endOffset := tensorDataStart + int64(t.offset) + int64(dataSize)
-		if endOffset > actualSize {
+		if endOffset > fileSize {
 			return fmt.Errorf("tensor %q data not within file bounds: offset=%d, size=%d, end=%d, file_size=%d",
-				t.name, t.offset, dataSize, endOffset, actualSize)
+				t.name, t.offset, dataSize, endOffset, fileSize)
 		}
 	}
 

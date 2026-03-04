@@ -289,7 +289,7 @@ func (c *Client) GetFileMetadata(ctx context.Context, repoID string) ([]FileInfo
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch model metadata: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HF API returned status %d for repo %s", resp.StatusCode, repoID)
@@ -336,7 +336,7 @@ func (c *Client) ResumeDownloadFile(ctx context.Context, repoID, filePath string
 	if err != nil {
 		return 0, fmt.Errorf("failed to download file: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 416 Range Not Satisfiable means offset is at or past end — file is already complete
 	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {

@@ -26,6 +26,14 @@ import (
 	"testing"
 )
 
+// writeLE is a test helper that writes binary data in little-endian format, failing the test on error.
+func writeLE(t *testing.T, buf *bytes.Buffer, data interface{}) {
+	t.Helper()
+	if err := binary.Write(buf, binary.LittleEndian, data); err != nil {
+		t.Fatalf("binary.Write failed: %v", err)
+	}
+}
+
 // buildGGUFFile builds a minimal valid GGUF v3 file with the given tensors.
 // Each tensor entry specifies name, dimensions, type ID, and data.
 func buildGGUFFile(t *testing.T, tensors []testTensor, alignment uint64) []byte {
@@ -35,22 +43,22 @@ func buildGGUFFile(t *testing.T, tensors []testTensor, alignment uint64) []byte 
 	// Magic
 	buf.WriteString("GGUF")
 	// Version 3
-	binary.Write(&buf, binary.LittleEndian, uint32(3))
+	writeLE(t, &buf, uint32(3))
 	// Tensor count
-	binary.Write(&buf, binary.LittleEndian, uint64(len(tensors)))
+	writeLE(t, &buf, uint64(len(tensors)))
 
 	// Metadata KV count — include general.alignment if non-default
 	if alignment != 32 {
-		binary.Write(&buf, binary.LittleEndian, uint64(1))
+		writeLE(t, &buf, uint64(1))
 		// Key: "general.alignment"
 		key := "general.alignment"
-		binary.Write(&buf, binary.LittleEndian, uint64(len(key)))
+		writeLE(t, &buf, uint64(len(key)))
 		buf.WriteString(key)
 		// Value type: uint32
-		binary.Write(&buf, binary.LittleEndian, uint32(ggufTypeUint32))
-		binary.Write(&buf, binary.LittleEndian, uint32(alignment))
+		writeLE(t, &buf, uint32(ggufTypeUint32))
+		writeLE(t, &buf, uint32(alignment))
 	} else {
-		binary.Write(&buf, binary.LittleEndian, uint64(0))
+		writeLE(t, &buf, uint64(0))
 	}
 
 	// Compute tensor data section: offset for each tensor, total data size
@@ -70,18 +78,18 @@ func buildGGUFFile(t *testing.T, tensors []testTensor, alignment uint64) []byte 
 	// Write tensor info entries
 	for i, tensor := range tensors {
 		// Name
-		binary.Write(&buf, binary.LittleEndian, uint64(len(tensor.name)))
+		writeLE(t, &buf, uint64(len(tensor.name)))
 		buf.WriteString(tensor.name)
 		// nDims
-		binary.Write(&buf, binary.LittleEndian, uint32(len(tensor.dims)))
+		writeLE(t, &buf, uint32(len(tensor.dims)))
 		// Dimensions
 		for _, d := range tensor.dims {
-			binary.Write(&buf, binary.LittleEndian, d)
+			writeLE(t, &buf, d)
 		}
 		// Type
-		binary.Write(&buf, binary.LittleEndian, tensor.typeID)
+		writeLE(t, &buf, tensor.typeID)
 		// Offset
-		binary.Write(&buf, binary.LittleEndian, layouts[i].offset)
+		writeLE(t, &buf, layouts[i].offset)
 	}
 
 	// Pad to alignment

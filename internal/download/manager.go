@@ -572,7 +572,7 @@ func (m *Manager) tryResumeDownload(ctx context.Context, repoID, filePath, local
 	if err != nil {
 		return 0, fmt.Errorf("failed to open file for resume: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	written, err := m.hfClient.ResumeDownloadFile(ctx, repoID, filePath, localSize, f)
 	if err != nil {

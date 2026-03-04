@@ -184,6 +184,15 @@ type ModelResources struct {
 	MemoryLimit string `json:"memoryLimit,omitempty"`
 }
 
+// EvictionPolicy controls when a model can be evicted.
+// +kubebuilder:validation:Enum=Default;MemoryPressureOnly
+type EvictionPolicy string
+
+const (
+	EvictionPolicyDefault            EvictionPolicy = "Default"
+	EvictionPolicyMemoryPressureOnly EvictionPolicy = "MemoryPressureOnly"
+)
+
 // ScalingConfig defines scaling behavior
 type ScalingConfig struct {
 	// Enabled controls whether auto-scaling is enabled
@@ -202,6 +211,13 @@ type ScalingConfig struct {
 	// ScaleToZeroDelay is how long after last request before scaling to zero
 	// Defaults to CooldownPeriod if not set
 	ScaleToZeroDelay string `json:"scaleToZeroDelay,omitempty"`
+
+	// EvictionPolicy controls when a running model can be evicted.
+	// "Default" allows idle timeout and memory-pressure eviction.
+	// "MemoryPressureOnly" disables idle timeout — model stays loaded
+	// until another model needs the memory.
+	// +kubebuilder:default=Default
+	EvictionPolicy EvictionPolicy `json:"evictionPolicy,omitempty"`
 }
 
 // ServiceConfig defines the service configuration

@@ -503,6 +503,11 @@ func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model 
 		return ctrl.Result{}, nil
 	}
 
+	// If eviction policy is MemoryPressureOnly, skip idle scaling
+	if model.Spec.Scaling.EvictionPolicy == inferencev1alpha1.EvictionPolicyMemoryPressureOnly {
+		return ctrl.Result{}, nil
+	}
+
 	// Check if there are active requests (from registry)
 	entry := r.Registry.Get(model.Namespace, model.Name)
 	if entry != nil && entry.ActiveRequests > 0 {

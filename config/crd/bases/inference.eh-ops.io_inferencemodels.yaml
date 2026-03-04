@@ -1163,6 +1163,17 @@ spec:
                     default: true
                     description: Enabled controls whether auto-scaling is enabled
                     type: boolean
+                  evictionPolicy:
+                    default: Default
+                    description: |-
+                      EvictionPolicy controls when a running model can be evicted.
+                      "Default" allows idle timeout and memory-pressure eviction.
+                      "MemoryPressureOnly" disables idle timeout — model stays loaded
+                      until another model needs the memory.
+                    enum:
+                    - Default
+                    - MemoryPressureOnly
+                    type: string
                   maxReplicas:
                     default: 1
                     description: MaxReplicas is the maximum number of replicas

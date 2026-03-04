@@ -35,7 +35,7 @@ import (
 )
 
 func TestComputeChunks(t *testing.T) {
-	cd := &chunkedDownloader{chunkCount: 4}
+	cd := &chunkedDownloader{chunkSize: 250} // 250-byte chunks for testing
 
 	tests := []struct {
 		name     string
@@ -43,9 +43,9 @@ func TestComputeChunks(t *testing.T) {
 		wantN    int
 	}{
 		{"standard", 1000, 4},
-		{"small file fewer chunks", 3, 3},
+		{"small file single chunk", 3, 1},
 		{"single byte", 1, 1},
-		{"exact division", 400, 4},
+		{"exact division", 500, 2},
 	}
 
 	for _, tt := range tests {
@@ -191,7 +191,8 @@ func TestHeadRequestParseHeaders(t *testing.T) {
 	cd := &chunkedDownloader{
 		hfClient:   hfClient,
 		bufferPool: NewBufferPool(DefaultBufferSize),
-		chunkCount: DefaultChunkCount,
+		chunkSize:  DefaultChunkSize,
+		maxWorkers: MaxConcurrentChunks,
 		backoff:    defaultBackoff,
 	}
 
@@ -308,7 +309,8 @@ func TestChunkedDownloadEndToEnd(t *testing.T) {
 	cd := &chunkedDownloader{
 		hfClient:   hfClient,
 		bufferPool: NewBufferPool(DefaultBufferSize),
-		chunkCount: 4,
+		chunkSize:  25 * 1024, // 25KB chunks → 4 chunks for 100KB
+		maxWorkers: 4,
 		backoff:    defaultBackoff,
 	}
 
@@ -401,7 +403,8 @@ func TestChunkedDownloadRetryOnError(t *testing.T) {
 	cd := &chunkedDownloader{
 		hfClient:   huggingface.NewClient(huggingface.Config{}),
 		bufferPool: NewBufferPool(DefaultBufferSize),
-		chunkCount: 1, // single chunk to simplify retry testing
+		chunkSize:  1024 * 1024, // large chunk → single chunk for retry testing
+		maxWorkers: 1,
 		backoff: backoffConfig{
 			Initial:    1 * time.Millisecond, // fast retries for testing
 			Max:        10 * time.Millisecond,
@@ -453,7 +456,8 @@ func TestChunkedDownloadContextCancel(t *testing.T) {
 	cd := &chunkedDownloader{
 		hfClient:   huggingface.NewClient(huggingface.Config{}),
 		bufferPool: NewBufferPool(DefaultBufferSize),
-		chunkCount: 2,
+		chunkSize:  5000, // 5KB chunks → 2 chunks for 10KB
+		maxWorkers: 2,
 		backoff: backoffConfig{
 			Initial:    1 * time.Millisecond,
 			Max:        5 * time.Millisecond,

@@ -36,8 +36,10 @@ import (
 const (
 	// MultipartThreshold is the minimum file size to use chunked downloads (256MB).
 	MultipartThreshold = 256 * 1024 * 1024
-	// DefaultChunkCount is the number of parallel chunks.
-	DefaultChunkCount = 8
+	// DefaultChunkSize is the target size per chunk (1 GB).
+	DefaultChunkSize = 1 * 1024 * 1024 * 1024
+	// MaxConcurrentChunks is the maximum number of chunks downloading in parallel.
+	MaxConcurrentChunks = 8
 	// DefaultMaxRetries is the maximum retry attempts per chunk.
 	DefaultMaxRetries = 4
 )
@@ -71,7 +73,8 @@ type chunkRange struct {
 type chunkedDownloader struct {
 	hfClient   *huggingface.Client
 	bufferPool *BufferPool
-	chunkCount int
+	chunkSize  int64
+	maxWorkers int
 	backoff    backoffConfig
 }
 
@@ -82,7 +85,8 @@ func newChunkedDownloader(hfClient *huggingface.Client, bufferPool *BufferPool) 
 	return &chunkedDownloader{
 		hfClient:   hfClient,
 		bufferPool: bufferPool,
-		chunkCount: DefaultChunkCount,
+		chunkSize:  DefaultChunkSize,
+		maxWorkers: MaxConcurrentChunks,
 		backoff:    defaultBackoff,
 	}
 }
@@ -100,42 +104,56 @@ func (cd *chunkedDownloader) Download(ctx context.Context, repoID, filePath, loc
 		return 0, ErrRangeNotSupported
 	}
 
-	fmt.Printf("[chunked] Starting chunked download: %s (%d bytes, %d chunks)\n",
-		filePath, fileSize, cd.chunkCount)
-
 	chunks := cd.computeChunks(fileSize)
+
+	fmt.Printf("[chunked] Starting chunked download: %s (%d bytes, %d chunks of ~%d MB, %d workers)\n",
+		filePath, fileSize, len(chunks), cd.chunkSize/1024/1024, cd.maxWorkers)
 
 	// Atomic progress counter across all chunks
 	var totalDownloaded atomic.Int64
 
-	// Download chunks in parallel
-	g := make(chan error, len(chunks))
+	// Worker pool: feed chunks through a channel, limited concurrency
+	chunkCh := make(chan chunkRange, len(chunks))
+	for _, c := range chunks {
+		chunkCh <- c
+	}
+	close(chunkCh)
+
+	errCh := make(chan error, len(chunks))
 	var wg sync.WaitGroup
 
-	for _, chunk := range chunks {
-		wg.Add(1)
-		go func(c chunkRange) {
-			defer wg.Done()
-			chunkProgress := func(n int64) {
-				newTotal := totalDownloaded.Add(n)
-				if onProgress != nil {
-					onProgress(newTotal)
-				}
-			}
-			if err := cd.downloadChunkWithRetry(ctx, repoID, filePath, localPath, c, chunkProgress); err != nil {
-				g <- fmt.Errorf("chunk %d failed: %w", c.Index, err)
-			}
-		}(chunk)
+	workers := cd.maxWorkers
+	if workers > len(chunks) {
+		workers = len(chunks)
 	}
 
-	// Wait for all goroutines then close error channel
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range chunkCh {
+				chunkProgress := func(n int64) {
+					newTotal := totalDownloaded.Add(n)
+					if onProgress != nil {
+						onProgress(newTotal)
+					}
+				}
+				if err := cd.downloadChunkWithRetry(ctx, repoID, filePath, localPath, c, chunkProgress); err != nil {
+					errCh <- fmt.Errorf("chunk %d failed: %w", c.Index, err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Wait for all workers then close error channel
 	go func() {
 		wg.Wait()
-		close(g)
+		close(errCh)
 	}()
 
 	// Collect first error
-	for err := range g {
+	for err := range errCh {
 		if err != nil {
 			return 0, err
 		}
@@ -190,28 +208,31 @@ func (cd *chunkedDownloader) headRequest(ctx context.Context, repoID, filePath s
 	return size, supportsRange, nil
 }
 
-// computeChunks divides fileSize into chunkCount ranges.
+// computeChunks divides fileSize into chunks of cd.chunkSize bytes.
 func (cd *chunkedDownloader) computeChunks(fileSize int64) []chunkRange {
-	count := cd.chunkCount
-	if int64(count) > fileSize {
-		count = int(fileSize)
+	chunkSize := cd.chunkSize
+	if chunkSize <= 0 {
+		chunkSize = DefaultChunkSize
 	}
+
+	count := int((fileSize + chunkSize - 1) / chunkSize) // ceiling division
 	if count <= 0 {
 		count = 1
 	}
 
-	chunkSize := fileSize / int64(count)
 	chunks := make([]chunkRange, count)
-
 	for i := 0; i < count; i++ {
+		start := int64(i) * chunkSize
+		end := start + chunkSize - 1
+		if end >= fileSize {
+			end = fileSize - 1
+		}
 		chunks[i] = chunkRange{
 			Index: i,
-			Start: int64(i) * chunkSize,
-			End:   int64(i+1)*chunkSize - 1,
+			Start: start,
+			End:   end,
 		}
 	}
-	// Last chunk gets any remainder
-	chunks[count-1].End = fileSize - 1
 
 	return chunks
 }

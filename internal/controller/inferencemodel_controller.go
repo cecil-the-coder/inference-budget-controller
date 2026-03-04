@@ -29,8 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -815,6 +817,13 @@ func (r *InferenceModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.Tracker = budget.NewTracker()
 	}
 
+	// Create a rate limiter that allows bursts but limits overall rate
+	// This prevents OOM when many models are reconciled simultaneously on startup
+	rateLimiter := workqueue.NewWithMaxWaitRateLimiter(
+		workqueue.NewItemExponentialFailureRateLimiter(time.Second, 30*time.Second),
+		60*time.Second, // max wait time
+	)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.InferenceModel{}).
 		Owns(&corev1.Pod{}).
@@ -822,6 +831,9 @@ func (r *InferenceModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&inferencev1alpha1.InferenceBackend{},
 			handler.EnqueueRequestsFromMapFunc(r.findModelsForBackend),
 		).
+		WithOptions(controller.Options{
+			RateLimiter: rateLimiter,
+		}).
 		Complete(r)
 }
 

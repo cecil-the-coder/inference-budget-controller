@@ -546,9 +546,11 @@ func validateGGUFTensorBounds(tensors []ggufTensorInfo, headerSize int64, alignm
 	}
 
 	for _, t := range tensors {
-		dataSize, err := computeTensorDataSize(t)
-		if err != nil {
-			return fmt.Errorf("tensor %q: %w", t.name, err)
+		dataSize, known := computeTensorDataSize(t)
+		if !known {
+			// Skip bounds check for unrecognized quantization types —
+			// we can't compute their size, but that's not corruption
+			continue
 		}
 
 		endOffset := tensorDataStart + int64(t.offset) + int64(dataSize)
@@ -562,24 +564,25 @@ func validateGGUFTensorBounds(tensors []ggufTensorInfo, headerSize int64, alignm
 }
 
 // computeTensorDataSize computes the byte size of a tensor's data from its dimensions and type.
-func computeTensorDataSize(t ggufTensorInfo) (uint64, error) {
+// Returns (size, known) where known is false if the quantization type is unrecognized.
+func computeTensorDataSize(t ggufTensorInfo) (uint64, bool) {
 	qinfo, ok := ggufQuantTypes[t.typeID]
 	if !ok {
-		return 0, fmt.Errorf("unknown quantization type: %d", t.typeID)
+		return 0, false
 	}
 
 	// Total number of elements
 	numElements := uint64(1)
 	for _, d := range t.dimensions {
 		if d == 0 {
-			return 0, nil
+			return 0, true
 		}
 		numElements *= d
 	}
 
 	// Number of blocks = ceil(numElements / blockSize)
 	numBlocks := (numElements + qinfo.blockSize - 1) / qinfo.blockSize
-	return numBlocks * qinfo.bytesPerBlock, nil
+	return numBlocks * qinfo.bytesPerBlock, true
 }
 
 // readGGUFString reads a GGUF string (uint64 length + bytes) and returns the string and bytes consumed.

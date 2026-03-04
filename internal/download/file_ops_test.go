@@ -287,9 +287,9 @@ func TestComputeTensorDataSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			size, err := computeTensorDataSize(tt.tensor)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			size, known := computeTensorDataSize(tt.tensor)
+			if !known {
+				t.Fatal("expected known type")
 			}
 			if size != tt.expected {
 				t.Errorf("expected %d, got %d", tt.expected, size)
@@ -300,9 +300,9 @@ func TestComputeTensorDataSize(t *testing.T) {
 
 func TestComputeTensorDataSize_UnknownType(t *testing.T) {
 	tensor := ggufTensorInfo{dimensions: []uint64{10}, typeID: 999}
-	_, err := computeTensorDataSize(tensor)
-	if err == nil {
-		t.Fatal("expected error for unknown type")
+	_, known := computeTensorDataSize(tensor)
+	if known {
+		t.Fatal("expected unknown type")
 	}
 }
 

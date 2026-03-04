@@ -351,7 +351,9 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 	}
 
 	// Update CRD status
-	model.Status.DownloadPhase = convertDownloadPhase(status.Phase)
+	phase := status.GetPhase()
+	logger.V(1).Info("Download status check", "model", model.Name, "phase", phase, "progress", status.GetProgress())
+	model.Status.DownloadPhase = convertDownloadPhase(phase)
 	model.Status.DownloadProgress = int32(status.Progress)
 	model.Status.DownloadBytesTotal = status.BytesTotal
 	model.Status.DownloadBytesDone = status.BytesDone
@@ -368,7 +370,7 @@ func (r *InferenceModelReconciler) handleDownload(ctx context.Context, model *in
 	}
 
 	// Handle completion/failure
-	switch status.Phase {
+	switch phase {
 	case download.PhaseComplete:
 		logger.Info("Model download complete", "model", model.Name)
 		r.Recorder.Event(model, "Normal", "DownloadComplete",

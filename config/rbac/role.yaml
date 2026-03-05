@@ -125,6 +125,15 @@ rules:
       - update
       - watch
 
+  # Metrics API (pod memory metrics from metrics-server)
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+
   # Gateway API (optional, for HTTPRoutes)
   - apiGroups:
       - gateway.networking.k8s.io

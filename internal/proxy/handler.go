@@ -588,6 +588,15 @@ func (s *Server) forwardRawRequest(c *gin.Context, model *inferencev1alpha1.Infe
 
 	resp, err := httpClient.Do(backendReq)
 	if err != nil {
+		if c.Request.Context().Err() == context.Canceled {
+			logger.V(1).Info("Client disconnected during request",
+				"model", model.Name,
+				"namespace", model.Namespace,
+			)
+			s.recordRequestMetrics(model, startTime, metrics.StatusError)
+			c.Abort()
+			return
+		}
 		logger.Error(err, "Failed to forward request to backend",
 			"model", model.Name,
 			"namespace", model.Namespace,
@@ -1055,6 +1064,15 @@ func (s *Server) forwardToBackend(c *gin.Context, model *inferencev1alpha1.Infer
 
 	resp, err := httpClient.Do(backendReq)
 	if err != nil {
+		if c.Request.Context().Err() == context.Canceled {
+			logger.V(1).Info("Client disconnected during request",
+				"model", model.Name,
+				"namespace", model.Namespace,
+			)
+			s.recordRequestMetrics(model, startTime, metrics.StatusError)
+			c.Abort()
+			return
+		}
 		logger.Error(err, "Failed to forward request to backend",
 			"model", model.Name,
 			"namespace", model.Namespace,

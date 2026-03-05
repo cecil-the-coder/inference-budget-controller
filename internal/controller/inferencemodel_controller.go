@@ -190,8 +190,9 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	err := r.Get(ctx, podKey, pod)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Pod doesn't exist - set registry state and wait for on-demand creation
+			// Pod doesn't exist - release memory budget and set registry state
 			// The proxy will create the pod when a request comes in
+			r.Tracker.ReleaseModel(model.Name, model.Namespace)
 			r.Registry.SetState(model.Namespace, model.Name, registry.StateNonexistent)
 
 			// Update status to reflect no pod exists (scaled to zero)

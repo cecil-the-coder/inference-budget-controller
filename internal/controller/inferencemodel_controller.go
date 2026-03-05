@@ -658,6 +658,7 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 
 	// Check if status update is needed
 	oldReady := model.Status.Ready
+	oldPeak := model.Status.ObservedPeakMemory
 
 	// Check if pod is ready (has PodReady condition true)
 	ready := false
@@ -733,7 +734,7 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 	}
 
 	// Only update if status changed
-	if oldReady != model.Status.Ready || len(model.Status.Conditions) == 0 {
+	if oldReady != model.Status.Ready || len(model.Status.Conditions) == 0 || oldPeak != model.Status.ObservedPeakMemory {
 		if err := r.Status().Update(ctx, model); err != nil {
 			if errors.IsConflict(err) {
 				// Conflict is expected, requeue

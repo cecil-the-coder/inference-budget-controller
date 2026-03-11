@@ -210,6 +210,9 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				logger.Error(err, "failed to update status condition")
 			}
 
+			// Update metrics even when scaled to zero so dashboards show model state
+			r.Metrics.UpdateModelMetrics(model)
+
 			// Requeue periodically to check for changes
 			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
 		}

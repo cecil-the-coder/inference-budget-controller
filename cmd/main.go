@@ -25,6 +25,7 @@ import (
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -150,6 +151,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse max model memory for reconciler budget metrics
+	var maxMemoryBytes int64
+	if qty, err := resource.ParseQuantity(maxModelMemory); err == nil {
+		maxMemoryBytes = qty.Value()
+	}
+
 	if err = (&controller.InferenceModelReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
@@ -160,6 +167,7 @@ func main() {
 		DownloadManager: downloadMgr,
 		CacheManager:    cacheMgr,
 		MetricsClient:   metricsCS.MetricsV1beta1(),
+		MaxMemoryBytes:  maxMemoryBytes,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceModel")
 		os.Exit(1)

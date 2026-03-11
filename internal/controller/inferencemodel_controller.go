@@ -95,6 +95,7 @@ type InferenceModelReconciler struct {
 	DownloadManager *download.Manager
 	CacheManager    *download.CacheManager
 	MetricsClient   metricsv.MetricsV1beta1Interface
+	MaxMemoryBytes  int64 // Global memory budget in bytes (from MAX_MODEL_MEMORY)
 }
 
 //+kubebuilder:rbac:groups=inference.eh-ops.io,resources=inferencemodels,verbs=get;list;watch;create;update;patch;delete
@@ -212,6 +213,7 @@ func (r *InferenceModelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 			// Update metrics even when scaled to zero so dashboards show model state
 			r.Metrics.UpdateModelMetrics(model)
+			r.updateBudgetMetrics()
 
 			// Requeue periodically to check for changes
 			return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
@@ -646,6 +648,19 @@ func (r *InferenceModelReconciler) deleteIdlePod(ctx context.Context, model *inf
 	return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
 }
 
+// updateBudgetMetrics emits global memory budget metrics from the tracker
+func (r *InferenceModelReconciler) updateBudgetMetrics() {
+	if r.MaxMemoryBytes <= 0 {
+		return
+	}
+	used := r.Tracker.GetTotalAllocatedMemory()
+	available := r.MaxMemoryBytes - used
+	if available < 0 {
+		available = 0
+	}
+	r.Metrics.UpdateNodeMemoryMetrics("global", r.MaxMemoryBytes, used, available)
+}
+
 // isScaledDown checks if the model is already in scaled-to-zero state
 func isScaledDown(model *inferencev1alpha1.InferenceModel) bool {
 	for _, cond := range model.Status.Conditions {
@@ -752,6 +767,7 @@ func (r *InferenceModelReconciler) updateStatus(ctx context.Context, model *infe
 
 	// Update metrics
 	r.Metrics.UpdateModelMetrics(model)
+	r.updateBudgetMetrics()
 
 	// Structured logging with key observability fields
 	logger.V(1).Info("Updated InferenceModel status",

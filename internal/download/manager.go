@@ -278,7 +278,7 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		progressDone := make(chan struct{})
 		go func() {
 			defer close(progressDone)
-			ticker := time.NewTicker(5 * time.Second)
+			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			lastSize := int64(0)
 			lastTime := time.Now()
@@ -309,9 +309,14 @@ func (m *Manager) performDownload(ctx context.Context, modelName string, spec *D
 		}()
 
 		// Create progress callback for chunked downloads
+		var lastLogTime time.Time
 		onProgress := func(bytesDone int64) {
 			status.UpdateFileProgress(filePath, bytesDone, 0, PhaseDownloading)
-			logf("Progress: %s - %.1f MB downloaded", filePath, float64(bytesDone)/1024/1024)
+			// Throttle log output to at most once per 30 seconds
+			if now := time.Now(); now.Sub(lastLogTime) >= 30*time.Second {
+				lastLogTime = now
+				logf("Progress: %s - %.1f MB downloaded", filePath, float64(bytesDone)/1024/1024)
+			}
 		}
 
 		// Try Xet download first, fall back to regular download

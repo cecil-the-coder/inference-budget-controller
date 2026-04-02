@@ -1,0 +1,382 @@
+# =============================================================================
+# fox-operator DaemonSet
+#
+# Deploys the fox-operator onto the shadow node (AMD Ryzen AI 385+ / gfx1151).
+# The shadow node is a single bare-metal machine tainted and labelled so that
+# only this DaemonSet and inference workload pods are scheduled there.
+#
+# Node requirements (applied out-of-band):
+#   kubectl label node <shadow-node> fox.inference/role=shadow-node
+#   kubectl taint node <shadow-node> fox.inference/shadow-node=true:NoSchedule
+#
+# Volume layout on the host:
+#   /models          — HuggingFace / GGUF model files (large, persistent)
+#   /dev/dri         — AMDGPU DRM render nodes (renderD128, card0, …)
+#   /etc/vulkan      — Host Vulkan ICD JSON (RADV or AMDGPU Pro)
+#   /run/fox         — Unix socket for in-node communication with engine pods
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+  labels:
+    app.kubernetes.io/name: fox-operator
+    app.kubernetes.io/part-of: fox
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fox-operator
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: fox-operator
+    app.kubernetes.io/component: operator
+---
+# ClusterRole — same permissions as the Go controller plus pod metrics
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fox-operator
+  labels:
+    app.kubernetes.io/name: fox-operator
+rules:
+  # Core API
+  - apiGroups: [""]
+    resources: [pods, nodes, namespaces, services, endpoints, configmaps, events]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods/status, nodes/status]
+    verbs: [get, update, patch]
+  # Apps
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Fox CRDs
+  - apiGroups: [fox.inference.io]
+    resources: ["*"]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Metrics
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+  # Leases (leader election)
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fox-operator
+  labels:
+    app.kubernetes.io/name: fox-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fox-operator
+subjects:
+  - kind: ServiceAccount
+    name: fox-operator
+    namespace: inference
+---
+# ConfigMap — runtime tuning knobs; override via kustomize patch
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fox-operator-config
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: fox-operator
+data:
+  # Total GPU memory visible to the operator's budget tracker (GTT pool, bytes)
+  # 120 GiB for Ryzen AI 385+ shared VRAM pool
+  MEMORY_BUDGET_BYTES: "128849018880"
+  # Vulkan ICD JSON path inside the container (also set in env below)
+  VK_ICD_FILENAMES: "/etc/vulkan/icd.d/radeon_icd.x86_64.json"
+  # gfx target for RDNA 3.5 (informational — llama.cpp uses Vulkan, not HIP)
+  AMDGPU_TARGET: "gfx1151"
+  # Log verbosity: error | warn | info | debug | trace
+  RUST_LOG: "info,fox_operator=debug,fox_engine=debug"
+  # Metrics server bind address
+  METRICS_BIND_ADDR: "0.0.0.0:9090"
+  # Health probe port
+  HEALTH_PROBE_BIND_ADDR: "0.0.0.0:8081"
+  # Model cache directory (must match the hostPath volume below)
+  MODEL_CACHE_DIR: "/models"
+  # Unix socket path for IPC with inference engine pods
+  FOX_SOCKET_PATH: "/run/fox/operator.sock"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fox-operator
+  namespace: inference
+  labels:
+    app: fox-operator
+    app.kubernetes.io/name: fox-operator
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/part-of: fox
+  annotations:
+    # Used by the rollout makefile target
+    app.kubernetes.io/version: "latest"
+spec:
+  selector:
+    matchLabels:
+      app: fox-operator
+  # Recreate is appropriate for a singleton DaemonSet on a dedicated node.
+  # Rolling update would briefly run two instances sharing the budget state.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: fox-operator
+        app.kubernetes.io/name: fox-operator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "9090"
+        prometheus.io/path:   "/metrics"
+    spec:
+      # -----------------------------------------------------------------------
+      # Scheduling constraints — only land on the labelled shadow node
+      # -----------------------------------------------------------------------
+      nodeSelector:
+        fox.inference/role: shadow-node
+
+      tolerations:
+        # The shadow node carries this taint to keep general workloads off it
+        - key: fox.inference/shadow-node
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        # Also tolerate the AMDGPU taint some node feature discovery plugins add
+        - key: amd.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      # -----------------------------------------------------------------------
+      # Identity & security
+      # -----------------------------------------------------------------------
+      serviceAccountName: fox-operator
+      automountServiceAccountToken: true
+
+      # The operator needs access to /dev/dri render nodes.
+      # Running as non-root with supplemental render group (gid=44).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 44          # render group — gives access to /dev/dri
+        seccompProfile:
+          type: RuntimeDefault
+
+      # -----------------------------------------------------------------------
+      # Init container — verify Vulkan visibility before starting the operator
+      # -----------------------------------------------------------------------
+      initContainers:
+        - name: vulkan-check
+          image: ghcr.io/cecil-the-coder/fox-operator:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Checking Vulkan ICD..."
+              ls -la /dev/dri/
+              echo "VK_ICD_FILENAMES=${VK_ICD_FILENAMES}"
+              # vulkaninfo returns non-zero if no GPU found; fail fast
+              vulkaninfo --summary 2>&1 | grep -i "GPU id" || \
+                (echo "ERROR: No Vulkan GPU found" && exit 1)
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          envFrom:
+            - configMapRef:
+                name: fox-operator-config
+          volumeMounts:
+            - name: dev-dri
+              mountPath: /dev/dri
+            - name: vulkan-icd
+              mountPath: /etc/vulkan/icd.d
+              readOnly: true
+
+      # -----------------------------------------------------------------------
+      # Main container
+      # -----------------------------------------------------------------------
+      containers:
+        - name: operator
+          image: ghcr.io/cecil-the-coder/fox-operator:latest
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/fox-operator"]
+          args:
+            - --leader-elect=false   # DaemonSet singleton — no election needed
+            - --metrics-bind-address=$(METRICS_BIND_ADDR)
+            - --health-probe-bind-address=$(HEALTH_PROBE_BIND_ADDR)
+
+          envFrom:
+            - configMapRef:
+                name: fox-operator-config
+
+          env:
+            # Propagate node name so the operator can self-identify its node
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # -------------------------------------------------------------------
+          # Resource limits
+          #
+          # CPU/memory: the operator itself is a lightweight Rust binary.
+          # The inference engine pods it manages have their own resource specs.
+          # GPU resource claim: the operator holds the GPU budget tracker but
+          # does not itself run CUDA/ROCm kernels — it only opens /dev/dri for
+          # Vulkan context validation and passes FDs to engine pods.
+          # -------------------------------------------------------------------
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+
+          volumeMounts:
+            # AMDGPU DRM render nodes — /dev/dri/renderD128
+            - name: dev-dri
+              mountPath: /dev/dri
+
+            # Host Vulkan ICD JSON (may be RADV or AMDGPU Pro depending on host)
+            - name: vulkan-icd
+              mountPath: /etc/vulkan/icd.d
+              readOnly: true
+
+            # Model files (GGUF) — large, NFS or local SSD on shadow node
+            - name: models
+              mountPath: /models
+              readOnly: false   # operator writes model download cache
+
+            # IPC socket directory shared with inference engine pods
+            - name: fox-socket
+              mountPath: /run/fox
+
+            # Operator needs to write its socket file and temp files
+            - name: tmp
+              mountPath: /tmp
+
+      # -----------------------------------------------------------------------
+      # Volumes
+      # -----------------------------------------------------------------------
+      volumes:
+        # AMD GPU render nodes — the operator opens these for Vulkan context
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+            type: Directory
+
+        # Host Vulkan ICD configuration — picks up whatever driver the host has
+        # (Mesa RADV in stock Ubuntu, AMDGPU Pro in production)
+        - name: vulkan-icd
+          hostPath:
+            path: /etc/vulkan/icd.d
+            type: DirectoryOrCreate
+
+        # Model storage — adjust to match your storage class or NFS mount
+        - name: models
+          hostPath:
+            path: /models
+            type: DirectoryOrCreate
+
+        # Unix socket directory shared via hostPath so engine pods can connect
+        - name: fox-socket
+          hostPath:
+            path: /run/fox
+            type: DirectoryOrCreate
+
+        # Writable /tmp for the read-only root filesystem
+        - name: tmp
+          emptyDir: {}
+
+      terminationGracePeriodSeconds: 30
+      # Give the operator time to drain in-flight model downloads
+      # before SIGKILL
+
+---
+# Service — exposes the Prometheus metrics endpoint for scraping
+apiVersion: v1
+kind: Service
+metadata:
+  name: fox-operator-metrics
+  namespace: inference
+  labels:
+    app: fox-operator
+    app.kubernetes.io/name: fox-operator
+  annotations:
+    prometheus.io/scrape: "true"
+spec:
+  selector:
+    app: fox-operator
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+  type: ClusterIP
+---
+# ServiceMonitor for Prometheus Operator (optional — remove if not using it)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fox-operator
+  namespace: inference
+  labels:
+    app: fox-operator
+spec:
+  selector:
+    matchLabels:
+      app: fox-operator
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics

@@ -1,0 +1,256 @@
+# =============================================================================
+# Dockerfile.fox — Multi-stage build for the fox-operator (Rust + llama.cpp)
+#
+# Target hardware: AMD Ryzen AI 385+ / gfx1151 (RDNA 3.5) — Vulkan backend
+# Build args:
+#   FOX_FEATURES   — cargo feature list  (default: vulkan)
+#   REGISTRY       — image registry prefix
+#
+# Stages:
+#   1. sys-deps     — APT packages, Vulkan SDK, AMDGPU headers (cache layer)
+#   2. cmake-build  — builds llama.cpp static libs via cmake
+#   3. rust-build   — cargo build of the full workspace
+#   4. runtime      — minimal runtime image with Vulkan ICD + ROCm dispatch
+# =============================================================================
+
+ARG UBUNTU_VERSION=24.04
+ARG RUST_VERSION=1.87
+ARG LLVM_VERSION=18
+ARG VULKAN_SDK_VERSION=1.3.296.0
+ARG FOX_FEATURES=vulkan
+
+# =============================================================================
+# Stage 1 — sys-deps
+# Install every build-time OS dependency into one layer so the rest of the
+# build can cache-bust only when these versions change.
+# =============================================================================
+FROM ubuntu:${UBUNTU_VERSION} AS sys-deps
+
+ARG LLVM_VERSION
+ARG VULKAN_SDK_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build tools
+    build-essential \
+    cmake \
+    ninja-build \
+    pkg-config \
+    git \
+    curl \
+    ca-certificates \
+    gpg \
+    wget \
+    # Bindgen / clang
+    clang-${LLVM_VERSION} \
+    libclang-${LLVM_VERSION}-dev \
+    llvm-${LLVM_VERSION}-dev \
+    # OpenMP (required by llama.cpp CPU kernels even in Vulkan mode)
+    libgomp1 \
+    # Vulkan loader + headers
+    libvulkan-dev \
+    vulkan-tools \
+    # GLSL compiler (llama.cpp compiles its shaders at build time)
+    glslang-tools \
+    glslc \
+    # X11/DRM headers needed by mesa / AMDGPU Vulkan ICD
+    libdrm-dev \
+    libx11-dev \
+    libxcb1-dev \
+    # Python (cmake scripts in llama.cpp)
+    python3 \
+    # Misc
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Symlink clang so cmake's FindClang works without explicit version suffix
+RUN update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-${LLVM_VERSION}   100 \
+ && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${LLVM_VERSION} 100
+
+# ---- AMDGPU / ROCm LLVM (provides amdgpu_drm.h and Mesa Vulkan ICD) --------
+# We install the Mesa RADV ICD (open-source, ships in Ubuntu) plus the AMDGPU
+# Pro Vulkan ICD for production.  In CI we only install RADV.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    mesa-vulkan-drivers \
+    libgl1-mesa-dri \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Vulkan SDK (LunarG) — only the subset needed for building shaders ------
+# We need glslangValidator + spirv-tools.  Ubuntu's glslang-tools is often
+# stale, so we pull the official SDK tarball and put the binaries on PATH.
+RUN set -eux; \
+    VULKAN_SDK_MAJOR=$(echo ${VULKAN_SDK_VERSION} | cut -d. -f1-3); \
+    curl -fsSL \
+      "https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz" \
+      -o /tmp/vulkansdk.tar.xz && \
+    mkdir -p /opt/vulkan-sdk && \
+    tar -xf /tmp/vulkansdk.tar.xz -C /opt/vulkan-sdk --strip-components=2 \
+        "${VULKAN_SDK_VERSION}/x86_64" && \
+    rm /tmp/vulkansdk.tar.xz
+
+ENV VULKAN_SDK=/opt/vulkan-sdk
+ENV PATH="${VULKAN_SDK}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${VULKAN_SDK}/lib:${LD_LIBRARY_PATH}"
+ENV VK_LAYER_PATH="${VULKAN_SDK}/share/vulkan/explicit_layer.d"
+
+# =============================================================================
+# Stage 2 — cmake-build
+# Clone llama.cpp (pinned commit) and build static libraries for the Vulkan
+# backend.  We do this in a dedicated stage so the heavy cmake compilation is
+# cached separately from Rust source changes.
+# =============================================================================
+FROM sys-deps AS cmake-build
+
+ARG LLAMA_CPP_REF=b5157
+
+WORKDIR /src/llama.cpp
+
+# If vendor/llama.cpp is already present in the build context it will be copied
+# in the rust-build stage.  Here we build from the canonical upstream source
+# pinned to the same commit used as a git submodule.
+RUN git init && \
+    git remote add origin https://github.com/ggerganov/llama.cpp.git && \
+    git fetch --depth=1 origin ${LLAMA_CPP_REF} && \
+    git checkout FETCH_HEAD
+
+WORKDIR /build/llama.cpp
+RUN cmake /src/llama.cpp \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_TOOLS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_SERVER=OFF \
+      -DLLAMA_BUILD_COMMON=OFF \
+      # Vulkan backend
+      -DGGML_VULKAN=ON \
+      -DVULKAN_SDK=/opt/vulkan-sdk \
+      # Disable all other GPU backends
+      -DGGML_CUDA=OFF \
+      -DGGML_METAL=OFF \
+      -DGGML_OPENCL=OFF \
+      && \
+    ninja llama ggml ggml-base ggml-cpu ggml-vulkan
+
+# Expose the header tree and built archives for the Rust stage
+# Layout expected by build.rs:
+#   /llama-artifacts/include/       <- llama.h, ggml/include/ggml.h
+#   /llama-artifacts/build/src/     <- libllama.a
+#   /llama-artifacts/build/ggml/src/<- libggml*.a
+#   /llama-artifacts/build/ggml/src/ggml-vulkan/ <- libggml-vulkan.a
+RUN mkdir -p /llama-artifacts && \
+    cp -r /src/llama.cpp/include  /llama-artifacts/include && \
+    cp -r /src/llama.cpp/ggml     /llama-artifacts/ggml-src && \
+    mkdir -p /llama-artifacts/build && \
+    cp -r /build/llama.cpp/src               /llama-artifacts/build/src && \
+    cp -r /build/llama.cpp/ggml/src          /llama-artifacts/build/ggml-src
+
+# =============================================================================
+# Stage 3 — rust-build
+# Install Rust toolchain and build the full Cargo workspace.
+# FOX_SKIP_LLAMA is NOT set; build.rs will locate the pre-built libs via the
+# LLAMA_PREBUILT_DIR env var (added to build.rs — see design notes below).
+# =============================================================================
+FROM sys-deps AS rust-build
+
+ARG RUST_VERSION
+ARG FOX_FEATURES
+
+# Install rustup + the pinned stable toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+      sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal && \
+    . /root/.cargo/env && \
+    rustup component add clippy rustfmt
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Copy pre-built llama.cpp artifacts from cmake-build stage
+COPY --from=cmake-build /llama-artifacts /llama-artifacts
+# Also copy headers into expected vendor path so bindgen can find llama.h
+RUN mkdir -p /workspace/crates/llama-sys/vendor/llama.cpp && \
+    cp -r /llama-artifacts/include    /workspace/crates/llama-sys/vendor/llama.cpp/include && \
+    cp -r /llama-artifacts/ggml-src   /workspace/crates/llama-sys/vendor/llama.cpp/ggml
+
+# Copy the entire workspace source
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+# -- Dependency pre-fetch (cache layer) ----------------------------------------
+# Build only dependencies first so source edits don't re-download crates.
+# We build a dummy main for each binary crate to warm the dep cache.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/workspace/target \
+    LLAMA_PREBUILT_DIR=/llama-artifacts \
+    FOX_SKIP_LLAMA_CMAKE=1 \
+    cargo build --release \
+      --features ${FOX_FEATURES} \
+      -p fox-operator \
+      2>&1 | grep -v "^warning:" || true
+
+# -- Final binary build --------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/workspace/target \
+    LLAMA_PREBUILT_DIR=/llama-artifacts \
+    FOX_SKIP_LLAMA_CMAKE=1 \
+    cargo build --release \
+      --features ${FOX_FEATURES} \
+      -p fox-operator && \
+    # Copy out of the cache mount before it closes
+    cp /workspace/target/release/fox-operator /fox-operator
+
+# =============================================================================
+# Stage 4 — runtime
+# Minimal image that ships only the binary and the runtime Vulkan + GPU libs.
+# No Rust, no cmake, no SDK headers.
+# =============================================================================
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Runtime Vulkan dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Vulkan loader (libvulkan.so.1)
+    libvulkan1 \
+    # Mesa RADV open-source AMD Vulkan ICD
+    mesa-vulkan-drivers \
+    # OpenMP runtime (libgomp.so.1 — needed by llama CPU kernels)
+    libgomp1 \
+    # Required by llama.cpp regardless of backend
+    libstdc++6 \
+    # GPU DRM access (open /dev/dri/renderD*)
+    libdrm2 \
+    libdrm-amdgpu1 \
+    # Minimal utils for liveness probe script
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the Vulkan SDK ICD JSON (tells the loader to use RADV vs. AMDGPU Pro)
+# In production, the host /etc/vulkan directory is bind-mounted (see DaemonSet).
+# This layer provides a fallback Mesa ICD if the host mount is absent.
+COPY --from=sys-deps /opt/vulkan-sdk/share/vulkan /usr/share/vulkan
+
+# Binary
+COPY --from=rust-build /fox-operator /usr/local/bin/fox-operator
+
+# Non-root user (operator runs with read-only access to /dev/dri via group)
+RUN groupadd -g 44 render && \
+    groupadd -g 1000 fox && \
+    useradd -u 1000 -g fox -G render -s /bin/false -d /nonexistent -M fox
+
+# Vulkan ICD search path — the DaemonSet also sets this from the host path
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+
+WORKDIR /
+USER fox
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/usr/local/bin/fox-operator"]

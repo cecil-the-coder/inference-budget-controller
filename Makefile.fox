@@ -1,0 +1,218 @@
+# =============================================================================
+# Makefile.fox — Build targets for the fox-operator Rust workspace
+#
+# Usage:
+#   make -f Makefile.fox <target>
+#
+# Required env vars (override on CLI or in .env):
+#   REGISTRY          — OCI registry prefix, e.g. ghcr.io/myorg
+#   KUBECONFIG        — path to kubeconfig (default: ~/.kube/config)
+#
+# Optional env vars:
+#   FOX_FEATURES      — cargo features to enable (default: vulkan)
+#   TAG               — image tag (default: git short SHA)
+#   LLAMA_CPP_REF     — llama.cpp git ref to embed (default: b5157)
+#   SHADOW_NODE       — kubernetes node name of the shadow node
+#   CARGO_INCREMENTAL — set to 1 for local dev, 0 for CI (default: auto)
+# =============================================================================
+
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+# --- Configuration -----------------------------------------------------------
+REGISTRY        ?= ghcr.io/cecil-the-coder
+IMAGE_NAME      := fox-operator
+TAG             ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+IMAGE           := $(REGISTRY)/$(IMAGE_NAME):$(TAG)
+IMAGE_LATEST    := $(REGISTRY)/$(IMAGE_NAME):latest
+
+FOX_FEATURES    ?= vulkan
+LLAMA_CPP_REF   ?= b5157
+SHADOW_NODE     ?= shadow-node
+KUBECONFIG      ?= $(HOME)/.kube/config
+NAMESPACE       ?= inference
+
+# Detect local vs CI: in CI GITHUB_ACTIONS=true
+ifeq ($(GITHUB_ACTIONS),true)
+  CARGO_INCREMENTAL ?= 0
+  CARGO_TERM_COLOR  ?= always
+else
+  CARGO_INCREMENTAL ?= 1
+  CARGO_TERM_COLOR  ?= auto
+endif
+
+# cargo invocation used for local builds (not Docker)
+CARGO := cargo
+CARGO_FLAGS := --features $(FOX_FEATURES)
+CARGO_RELEASE_FLAGS := $(CARGO_FLAGS) --release
+
+# kubectl / kustomize
+KUBECTL  := kubectl --kubeconfig=$(KUBECONFIG)
+KUSTOMIZE := kustomize
+
+# =============================================================================
+# Phony targets
+# =============================================================================
+.PHONY: help build build-release test test-unit test-integration lint fmt \
+        clippy check docker-build docker-push docker-build-push deploy undeploy \
+        daemonset-apply daemonset-delete logs port-forward generate manifests \
+        vendor-update clean clean-docker
+
+# =============================================================================
+# Help
+# =============================================================================
+help: ## Show this help message
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make -f Makefile.fox \033[36m<target>\033[0m\n\nTargets:\n"} \
+	  /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+# =============================================================================
+# Local Rust builds (no Docker)
+# =============================================================================
+build: ## Build debug binary locally (requires Vulkan SDK + llama.cpp vendor/)
+	$(CARGO) build $(CARGO_FLAGS) -p fox-operator
+
+build-release: ## Build optimised release binary locally
+	$(CARGO) build $(CARGO_RELEASE_FLAGS) -p fox-operator
+
+build-cpu: ## Build with cpu-only feature (no GPU, no Vulkan SDK needed)
+	$(CARGO) build --features cpu-only --release -p fox-operator
+
+# =============================================================================
+# Tests
+# =============================================================================
+test: test-unit ## Run all tests (alias)
+
+test-unit: ## Run unit tests (FOX_SKIP_LLAMA=1 — no llama.cpp needed)
+	FOX_SKIP_LLAMA=1 $(CARGO) test $(CARGO_FLAGS) \
+	  --workspace \
+	  --exclude llama-sys \
+	  -- --test-threads=4
+
+test-integration: ## Run integration tests against a live cluster
+	FOX_SKIP_LLAMA=1 $(CARGO) test $(CARGO_FLAGS) \
+	  --workspace \
+	  --test '*' \
+	  -- --ignored --test-threads=1
+
+test-stub: ## Build and test llama-sys stub path only
+	FOX_SKIP_LLAMA=1 $(CARGO) test $(CARGO_FLAGS) -p llama-sys
+
+# =============================================================================
+# Code quality
+# =============================================================================
+lint: clippy fmt-check ## Run all lint checks
+
+clippy: ## Run clippy (hard errors in CI)
+	FOX_SKIP_LLAMA=1 $(CARGO) clippy $(CARGO_FLAGS) \
+	  --workspace \
+	  --all-targets \
+	  -- -D warnings
+
+fmt: ## Auto-format all Rust source
+	$(CARGO) fmt --all
+
+fmt-check: ## Check formatting without modifying files
+	$(CARGO) fmt --all -- --check
+
+check: ## Type-check all crates without building
+	FOX_SKIP_LLAMA=1 $(CARGO) check $(CARGO_FLAGS) --workspace
+
+# =============================================================================
+# Docker / OCI image
+# =============================================================================
+docker-build: ## Build the fox-operator OCI image
+	docker buildx build \
+	  --file Dockerfile.fox \
+	  --build-arg FOX_FEATURES=$(FOX_FEATURES) \
+	  --build-arg LLAMA_CPP_REF=$(LLAMA_CPP_REF) \
+	  --tag $(IMAGE) \
+	  --tag $(IMAGE_LATEST) \
+	  --load \
+	  .
+
+docker-build-push: ## Build and push in a single buildx pass (uses registry cache)
+	docker buildx build \
+	  --file Dockerfile.fox \
+	  --build-arg FOX_FEATURES=$(FOX_FEATURES) \
+	  --build-arg LLAMA_CPP_REF=$(LLAMA_CPP_REF) \
+	  --tag $(IMAGE) \
+	  --tag $(IMAGE_LATEST) \
+	  --cache-from type=registry,ref=$(REGISTRY)/$(IMAGE_NAME):buildcache \
+	  --cache-to   type=registry,ref=$(REGISTRY)/$(IMAGE_NAME):buildcache,mode=max \
+	  --push \
+	  .
+
+docker-push: ## Push already-built image (use after docker-build)
+	docker push $(IMAGE)
+	docker push $(IMAGE_LATEST)
+
+docker-build-nocache: ## Full rebuild, no layer cache (useful to verify reproducibility)
+	docker buildx build \
+	  --file Dockerfile.fox \
+	  --build-arg FOX_FEATURES=$(FOX_FEATURES) \
+	  --build-arg LLAMA_CPP_REF=$(LLAMA_CPP_REF) \
+	  --no-cache \
+	  --tag $(IMAGE) \
+	  --load \
+	  .
+
+# =============================================================================
+# Kubernetes deployment
+# =============================================================================
+generate: ## Re-run CRD code generation (requires controller-gen)
+	cd crates/k8s-crd && cargo run --bin generate-crds
+
+manifests: ## Render kustomize manifests to stdout
+	$(KUSTOMIZE) build config/fox
+
+daemonset-apply: ## Apply the fox-operator DaemonSet to the cluster
+	$(KUBECTL) apply -f config/fox/daemonset.yaml
+
+daemonset-delete: ## Delete the fox-operator DaemonSet
+	$(KUBECTL) delete -f config/fox/daemonset.yaml --ignore-not-found
+
+deploy: docker-build-push daemonset-apply ## Build, push, and deploy in sequence
+	@echo "Waiting for DaemonSet rollout..."
+	$(KUBECTL) rollout status daemonset/fox-operator -n $(NAMESPACE) --timeout=120s
+
+undeploy: daemonset-delete ## Remove the fox-operator from the cluster
+
+logs: ## Tail logs from the fox-operator pod on the shadow node
+	$(KUBECTL) logs -n $(NAMESPACE) \
+	  -l app=fox-operator \
+	  --all-containers \
+	  --follow \
+	  --tail=200
+
+# =============================================================================
+# Vendor management
+# =============================================================================
+vendor-update: ## Update llama.cpp submodule to HEAD of LLAMA_CPP_REF
+	git -C crates/llama-sys/vendor/llama.cpp fetch origin $(LLAMA_CPP_REF)
+	git -C crates/llama-sys/vendor/llama.cpp checkout FETCH_HEAD
+	git add crates/llama-sys/vendor/llama.cpp
+	@echo "llama.cpp updated. Commit the submodule bump."
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+clean: ## Remove cargo build artifacts
+	$(CARGO) clean
+
+clean-docker: ## Remove local fox-operator images
+	docker images --format '{{.Repository}}:{{.Tag}}' | \
+	  grep "$(IMAGE_NAME)" | xargs -r docker rmi --force
+
+# =============================================================================
+# Shadow-node local build (run directly on the AI PC, not via Docker)
+# =============================================================================
+shadow-build: ## Build release binary natively on the shadow node (calls cargo directly)
+	@echo "==> Building natively for gfx1151 (RDNA 3.5)"
+	RUSTFLAGS="-C target-cpu=znver4" \
+	$(CARGO) build $(CARGO_RELEASE_FLAGS) -p fox-operator
+	@echo "==> Binary: target/release/fox-operator"
+
+shadow-run: shadow-build ## Build and run the operator directly on the shadow node
+	RUST_LOG=info \
+	VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
+	./target/release/fox-operator

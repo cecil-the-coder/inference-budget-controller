@@ -1,0 +1,17 @@
+# kind cluster configuration for fox-operator integration tests
+# Single control-plane node; no GPU — operator runs with FOX_SKIP_LLAMA stub
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    # Allow scheduling on the control plane (single-node cluster)
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          taints: []
+    # Mount the host /tmp/models into the node so tests can access fixtures
+    extraMounts:
+      - hostPath: /tmp/fox-test-models
+        containerPath: /models
+        readOnly: false

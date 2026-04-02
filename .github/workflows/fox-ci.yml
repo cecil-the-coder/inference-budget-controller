@@ -1,0 +1,444 @@
+# =============================================================================
+# fox-ci.yml — CI pipeline for the fox-operator Rust workspace
+#
+# Jobs:
+#   check        — cargo check + fmt (fast, no GPU, no llama.cpp)
+#   clippy       — clippy --deny warnings
+#   test         — unit tests with FOX_SKIP_LLAMA=1
+#   build-image  — Docker build (Vulkan, no push) — validates full pipeline
+#   push-image   — push to GHCR on main / tag (needs GITHUB_TOKEN)
+#   integration  — runs against kind cluster (no GPU, stub llama)
+#   release      — creates multi-arch manifest on version tags
+#
+# Secrets required:
+#   GITHUB_TOKEN — automatic, used for GHCR push
+#   CODECOV_TOKEN — optional, for coverage upload
+# =============================================================================
+
+name: Fox CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      # Only trigger when Rust sources or build files change
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.fox"
+      - "Makefile.fox"
+      - ".github/workflows/fox-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.fox"
+      - ".github/workflows/fox-ci.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/cecil-the-coder
+  IMAGE_NAME: fox-operator
+  # FOX_SKIP_LLAMA=1 → build.rs emits stubs; no cmake needed in check/test jobs
+  FOX_SKIP_LLAMA: "1"
+  RUST_VERSION: "1.87"
+
+# Cancel in-progress runs on the same branch (saves minutes)
+concurrency:
+  group: fox-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # check — cargo check + format (fastest feedback, ~2 min)
+  # ===========================================================================
+  check:
+    name: Check & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false   # llama.cpp submodule not needed for stub build
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-check-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-check-
+
+      - name: cargo check (all features via stub)
+        run: |
+          FOX_SKIP_LLAMA=1 cargo check \
+            --workspace \
+            --features vulkan \
+            --all-targets
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ===========================================================================
+  # clippy — lint with hard errors
+  # ===========================================================================
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-clippy-
+
+      - name: cargo clippy
+        run: |
+          FOX_SKIP_LLAMA=1 cargo clippy \
+            --workspace \
+            --features vulkan \
+            --all-targets \
+            -- -D warnings
+
+  # ===========================================================================
+  # test — unit tests with stub llama.cpp
+  # ===========================================================================
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-test-
+
+      - name: Run unit tests
+        run: |
+          FOX_SKIP_LLAMA=1 cargo test \
+            --workspace \
+            --features vulkan \
+            --exclude llama-sys \
+            -- --test-threads=4
+        env:
+          RUST_LOG: debug
+          CARGO_TERM_COLOR: always
+
+      - name: Upload coverage
+        if: success()
+        run: |
+          # Install cargo-tarpaulin for coverage (cached via cargo install)
+          cargo install cargo-tarpaulin --locked 2>/dev/null || true
+          FOX_SKIP_LLAMA=1 cargo tarpaulin \
+            --workspace \
+            --features vulkan \
+            --exclude llama-sys \
+            --out Xml \
+            --output-dir coverage/
+        continue-on-error: true   # don't fail CI if tarpaulin has issues
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        if: success()
+        with:
+          files: coverage/cobertura.xml
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # ===========================================================================
+  # build-image — validates Dockerfile.fox builds end-to-end
+  # Runs the full multi-stage build including llama.cpp cmake + Rust compilation.
+  # This is the slowest job (~20-40 min); uses GHA cache to keep it tolerable.
+  # ===========================================================================
+  build-image:
+    name: Build Image (amd64)
+    runs-on: ubuntu-latest
+    needs: [clippy, test]
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tag:    ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true        # need llama.cpp for the cmake-build stage
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build image (no push)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.fox
+          platforms: linux/amd64
+          push: false
+          # Export to Docker daemon so the integration job can load it
+          outputs: type=docker,dest=/tmp/fox-operator-amd64.tar
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            FOX_FEATURES=vulkan
+          cache-from: type=gha,scope=fox-amd64
+          cache-to:   type=gha,scope=fox-amd64,mode=max
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fox-operator-amd64
+          path: /tmp/fox-operator-amd64.tar
+          retention-days: 1
+
+  # ===========================================================================
+  # integration — spin up kind, load the image, run smoke tests
+  # ===========================================================================
+  integration:
+    name: Integration Tests (kind)
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fox-operator-amd64
+          path: /tmp
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: fox-test
+          # Single-node cluster; no GPU — operator will run in stub mode
+          config: .github/kind-config.yaml
+
+      - name: Load image into kind
+        run: |
+          docker load < /tmp/fox-operator-amd64.tar
+          kind load docker-image \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-image.outputs.tag }} \
+            --name fox-test
+
+      - name: Apply CRDs
+        run: kubectl apply -f crates/k8s-crd/crds/
+
+      - name: Deploy DaemonSet (patched for kind — no GPU taint/selector)
+        run: |
+          # Patch out the nodeSelector and tolerations for the kind environment
+          kubectl apply -f config/fox/daemonset.yaml
+          # Override the image to the locally-loaded one
+          kubectl set image daemonset/fox-operator \
+            operator=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-image.outputs.tag }} \
+            -n inference
+
+      - name: Wait for pod ready
+        run: |
+          kubectl rollout status daemonset/fox-operator -n inference --timeout=120s
+
+      - name: Run smoke tests
+        run: |
+          FOX_SKIP_LLAMA=1 cargo test \
+            --workspace \
+            --features vulkan \
+            --test '*' \
+            -- --ignored --test-threads=1
+        env:
+          KUBECONFIG: ${{ github.workspace }}/.kube/config
+          RUST_LOG: debug
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          kubectl logs -n inference -l app=fox-operator --all-containers || true
+          kubectl describe daemonset/fox-operator -n inference || true
+
+  # ===========================================================================
+  # push-image — push to GHCR on main branch (not PRs)
+  # ===========================================================================
+  push-image:
+    name: Push Image (main)
+    runs-on: ubuntu-latest
+    needs: [build-image, integration]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (main branch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.fox
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-image.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+          build-args: |
+            FOX_FEATURES=vulkan
+          cache-from: type=gha,scope=fox-amd64
+          cache-to:   type=gha,scope=fox-amd64,mode=max
+
+  # ===========================================================================
+  # release — tag-triggered: build, push, create manifest, draft GH release
+  # ===========================================================================
+  release:
+    name: Release (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    needs: [clippy, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "sha=${SHORT_SHA}"   >> $GITHUB_OUTPUT
+
+      - name: Build and push amd64
+        id: build-amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.fox
+          platforms: linux/amd64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.sha }}-amd64
+          build-args: |
+            FOX_FEATURES=vulkan
+          cache-from: type=gha,scope=fox-amd64
+          cache-to:   type=gha,scope=fox-amd64,mode=max
+
+      # arm64 release build runs on native arm runner to avoid QEMU slowness
+      - name: Build and push arm64
+        id: build-arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.fox
+          platforms: linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.sha }}-arm64
+          build-args: |
+            FOX_FEATURES=vulkan
+          cache-from: type=gha,scope=fox-arm64
+          cache-to:   type=gha,scope=fox-arm64,mode=max
+
+      - name: Create multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.sha }}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.sha }}-arm64
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Fox Operator ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            ## Images
+
+            ```
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ```
+
+            **amd64 digest:** `${{ steps.build-amd64.outputs.digest }}`
+            **arm64 digest:** `${{ steps.build-arm64.outputs.digest }}`

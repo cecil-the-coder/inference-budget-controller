@@ -1,0 +1,30 @@
+[package]
+name = "k8s-crd"
+version = "0.1.0"
+edition = "2021"
+description = "kube-rs CRD type definitions for the inference-budget-controller"
+license = "Apache-2.0"
+
+[dependencies]
+# kube-rs: CustomResource derive + runtime client types
+kube = { version = "0.91", features = ["derive", "runtime"] }
+
+# Kubernetes API types (Pod, EnvVar, Toleration, etc.)
+k8s-openapi = { version = "0.22", features = ["v1_29"] }
+
+# JSON Schema generation (required by kube derive)
+schemars = "0.8"
+
+# Serialization
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Duration / quantity parsing helpers
+thiserror = "1"
+
+# Structured logging used in scheme.rs
+tracing = "0.1"
+
+[dev-dependencies]
+# Used in unit tests to verify round-trip serialisation
+serde_json = "1"

@@ -85,6 +85,19 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 			return
 		}
 
+		// Use default model if model field is empty (for llama.cpp web UI in MODEL mode)
+		if req.Model == "" && s.DefaultModel != "" {
+			req.Model = s.DefaultModel
+			// Update the bodyBytes with the model field
+			var bodyMap map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &bodyMap); err == nil {
+				bodyMap["model"] = s.DefaultModel
+				if updatedBody, err := json.Marshal(bodyMap); err == nil {
+					bodyBytes = updatedBody
+				}
+			}
+		}
+
 		ctx := c.Request.Context()
 		logger := log.FromContext(ctx).WithValues("model", req.Model)
 

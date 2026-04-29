@@ -519,11 +519,12 @@ func (r *InferenceModelReconciler) handleIdleScaling(ctx context.Context, model 
 	}
 
 	// Check if there are active requests (from registry)
+	// If there are active requests, don't scale to zero, but still continue to update status
 	entry := r.Registry.Get(model.Namespace, model.Name)
 	if entry != nil && entry.ActiveRequests > 0 {
 		logger.V(1).Info("Model has active requests, skipping idle check",
 			"model", model.Name, "active_requests", entry.ActiveRequests)
-		return ctrl.Result{RequeueAfter: IdleCheckInterval}, nil
+		return ctrl.Result{}, nil
 	}
 
 	// Get cooldown period (default to 5 minutes)

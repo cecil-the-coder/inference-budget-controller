@@ -71,8 +71,13 @@ func (h *WebUIHandler) HandleIndex(c *gin.Context) {
 
 // HandleStatic serves static files (bundle.js, bundle.css, etc.).
 func (h *WebUIHandler) HandleStatic(c *gin.Context) {
-	// Get the filepath from the URL parameter
+	// Get the filepath from the URL parameter (for /ui/*filepath routes)
+	// or from the request path (for /bundle.js, /bundle.css routes)
 	filepath := c.Param("filepath")
+	if filepath == "" {
+		// Extract filename from the request path
+		filepath = c.Request.URL.Path
+	}
 
 	// Strip leading slash if present
 	filepath = strings.TrimPrefix(filepath, "/")

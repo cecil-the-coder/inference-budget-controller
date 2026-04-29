@@ -179,7 +179,7 @@ func DefaultProps() PropsResponse {
 			},
 		},
 		TotalSlots:   0, // We don't use slot-based scheduling
-		ModelPath:    "inference-budget-controller",
+		ModelPath:    "",
 		Role:         "inference-proxy",
 		Modalities:   Modalities{Vision: false, Audio: false},
 		ChatTemplate: "chatml",

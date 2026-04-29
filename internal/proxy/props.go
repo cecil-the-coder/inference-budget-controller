@@ -183,7 +183,7 @@ func DefaultProps() PropsResponse {
 		},
 		TotalSlots:   0, // We don't use slot-based scheduling
 		ModelPath:    "openyourmind-qwen3-6-35b-a3b-q4km",
-		Role:         "inference-proxy",
+		Role:         "model",
 		Modalities:   Modalities{Vision: false, Audio: false},
 		ChatTemplate: "chatml",
 		BosToken:     "<|endoftext|>",

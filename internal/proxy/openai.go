@@ -48,6 +48,7 @@ type ModelsResponse struct {
 // ModelInfo represents model information
 type ModelInfo struct {
 	ID      string `json:"id"`
+	Model   string `json:"model"` // Model name for llama.cpp UI compatibility
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`

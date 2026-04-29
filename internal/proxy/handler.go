@@ -648,6 +648,7 @@ func (s *Server) listModelsHandler(c *gin.Context) {
 	for _, item := range modelList.Items {
 		models = append(models, ModelInfo{
 			ID:      item.Spec.ModelName,
+			Model:   item.Spec.ModelName,
 			Object:  "model",
 			Created: item.CreationTimestamp.Unix(),
 			OwnedBy: "eh-ops",

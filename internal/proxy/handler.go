@@ -1216,72 +1216,9 @@ func (s *Server) handleNonStreamingResponse(c *gin.Context, resp *http.Response)
 		return
 	}
 
-	// Strip thinking content from response (between  and  tags)
-	body = stripThinkingContent(body)
-
 	if _, err := c.Writer.Write(body); err != nil {
 		log.FromContext(c.Request.Context()).Error(err, "Failed to write response body")
 	}
-}
-
-// stripThinkingContent removes thinking/reasoning content from the response body
-func stripThinkingContent(body []byte) []byte {
-	// Parse as JSON to modify the content field
-	var resp map[string]interface{}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return body
-	}
-
-	// Check for choices array
-	choices, ok := resp["choices"].([]interface{})
-	if !ok {
-		return body
-	}
-
-	for _, choice := range choices {
-		choiceMap, ok := choice.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		message, ok := choiceMap["message"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		content, ok := message["content"].(string)
-		if !ok {
-			continue
-		}
-		// Remove thinking content between  and
-		stripped := stripThinkingMarkers(content)
-		message["content"] = stripped
-	}
-
-	// Re-serialize
-	result, err := json.Marshal(resp)
-	if err != nil {
-		return body
-	}
-	return result
-}
-
-// stripThinkingMarkers removes content between  and  tags
-func stripThinkingMarkers(content string) string {
-	// Find and remove  ...  blocks
-	for {
-		startIdx := strings.Index(content, "")
-		if startIdx == -1 {
-			break
-		}
-		endIdx := strings.Index(content, "")
-		if endIdx == -1 || endIdx <= startIdx {
-			break
-		}
-		// Remove the thinking block including markers
-		content = content[:startIdx] + content[endIdx+3:]
-	}
-	// Clean up any leading/trailing whitespace and newlines
-	content = strings.TrimSpace(content)
-	return content
 }
 
 // getNodeSelectorKey generates a key from node selector for logging

@@ -60,6 +60,13 @@ spec:
             - --leader-elect
           image: controller:latest
           name: manager
+          ports:
+            - name: proxy
+              containerPort: 9000
+              protocol: TCP
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

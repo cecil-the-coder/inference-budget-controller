@@ -3,3 +3,5 @@ kind: Kustomization
 
 resources:
   - manager.yaml
+  - service.yaml
+  - httproute.yaml

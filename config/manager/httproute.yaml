@@ -10,13 +10,16 @@ spec:
   hostnames:
     - chat.whydontyou.work
   parentRefs:
-    - name: envoy-gateway
-      namespace: envoy-gateway-system
-      sectionName: http
+    - name: external-gateway
+      namespace: kube-system
+      sectionName: https-domain1
+    - name: external-gateway
+      namespace: kube-system
+      sectionName: http-domain1
   rules:
     - backendRefs:
-        - name: inference-proxy
-          port: 80
+        - name: controller-manager
+          port: 9000
       filters:
         - type: ResponseHeaderModifier
           responseHeaderModifier:

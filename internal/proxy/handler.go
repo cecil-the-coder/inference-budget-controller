@@ -99,9 +99,13 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 		}
 
 		// Force reasoning_format to "none" to disable thinking/reasoning output
+		// Also set chat_template_kwargs to disable thinking in the model's chat template
 		var bodyMapForReasoning map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &bodyMapForReasoning); err == nil {
 			bodyMapForReasoning["reasoning_format"] = "none"
+			bodyMapForReasoning["chat_template_kwargs"] = map[string]interface{}{
+				"enable_thinking": false,
+			}
 			if updatedBody, err := json.Marshal(bodyMapForReasoning); err == nil {
 				bodyBytes = updatedBody
 			}

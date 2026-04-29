@@ -101,25 +101,31 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 		// Disable thinking for Qwen3 models by:
 		// 1. Setting reasoning_format to "none"
 		// 2. Setting chat_template_kwargs enable_thinking to false
-		// 3. Adding /no_think to the last user message (Qwen3 specific)
+		// 3. Adding a system message to disable thinking (Qwen3 specific)
 		var bodyMapForReasoning map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &bodyMapForReasoning); err == nil {
 			bodyMapForReasoning["reasoning_format"] = "none"
 			bodyMapForReasoning["chat_template_kwargs"] = map[string]interface{}{
 				"enable_thinking": false,
 			}
-			// Add /no_think to the last user message for Qwen3 models
-			if messages, ok := bodyMapForReasoning["messages"].([]interface{}); ok && len(messages) > 0 {
-				for i := len(messages) - 1; i >= 0; i-- {
-					if msg, ok := messages[i].(map[string]interface{}); ok {
-						if role, ok := msg["role"].(string); ok && role == "user" {
-							if content, ok := msg["content"].(string); ok {
-								msg["content"] = content + " /no_think"
-								break
-							}
-						}
+			// Add system message to disable thinking for Qwen3 models
+			messages, _ := bodyMapForReasoning["messages"].([]interface{})
+			noThinkMsg := map[string]interface{}{
+				"role":    "system",
+				"content": "Do not show your thinking or reasoning process. Answer directly.",
+			}
+			// Check if there's already a system message, if so prepend, otherwise add
+			hasSystem := false
+			for _, m := range messages {
+				if msg, ok := m.(map[string]interface{}); ok {
+					if role, ok := msg["role"].(string); ok && role == "system" {
+						hasSystem = true
+						break
 					}
 				}
+			}
+			if !hasSystem {
+				bodyMapForReasoning["messages"] = append([]interface{}{noThinkMsg}, messages...)
 			}
 			if updatedBody, err := json.Marshal(bodyMapForReasoning); err == nil {
 				bodyBytes = updatedBody

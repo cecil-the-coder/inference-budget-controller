@@ -165,7 +165,7 @@ func DefaultProps() PropsResponse {
 				GrammarTriggers:     []string{},
 				PreservedTokens:     []int{},
 				ChatFormat:          "chatml",
-				ReasoningFormat:     "auto",
+				ReasoningFormat:     "none", // Disable reasoning by default
 				ReasoningInContent:  false,
 				GenerationPrompt:    "",
 				Samplers:            []string{"top_k", "typ_p", "top_p", "min_p", "temperature"},

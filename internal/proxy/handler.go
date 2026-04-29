@@ -98,6 +98,15 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 			}
 		}
 
+		// Force reasoning_format to "none" to disable thinking/reasoning output
+		var bodyMapForReasoning map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &bodyMapForReasoning); err == nil {
+			bodyMapForReasoning["reasoning_format"] = "none"
+			if updatedBody, err := json.Marshal(bodyMapForReasoning); err == nil {
+				bodyBytes = updatedBody
+			}
+		}
+
 		ctx := c.Request.Context()
 		logger := log.FromContext(ctx).WithValues("model", req.Model)
 

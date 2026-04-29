@@ -20,6 +20,9 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	inferencev1alpha1 "github.com/cecil-the-coder/inference-budget-controller/api/v1alpha1"
 )
 
 // PropsResponse represents the server properties response for the llama.cpp web UI.
@@ -196,9 +199,36 @@ func (s *Server) propsHandler(c *gin.Context) {
 	// Check if a model is specified in the query
 	modelName := c.Query("model")
 	if modelName != "" {
-		// Look up the model to potentially customize modalities
-		// For now, we return default props with the model path set
 		props.ModelPath = modelName
+
+		// Check if the model backend is running
+		if s.K8sClient != nil {
+			var model inferencev1alpha1.InferenceModel
+			err := s.K8sClient.Get(c.Request.Context(), client.ObjectKey{
+				Namespace: s.Namespace,
+				Name:      modelName,
+			}, &model)
+			if err == nil {
+				// Model exists - check if it's ready (pod running)
+				if model.Status.Ready && model.Status.Replicas > 0 {
+					// Model backend is running, set a non-zero ID to indicate "loaded"
+					props.DefaultGenerationSettings.ID = 1
+				}
+			}
+		}
+	} else {
+		// No model specified - use the default model from server config
+		props.ModelPath = s.DefaultModel
+		if props.ModelPath != "" && s.K8sClient != nil {
+			var model inferencev1alpha1.InferenceModel
+			err := s.K8sClient.Get(c.Request.Context(), client.ObjectKey{
+				Namespace: s.Namespace,
+				Name:      props.ModelPath,
+			}, &model)
+			if err == nil && model.Status.Ready && model.Status.Replicas > 0 {
+				props.DefaultGenerationSettings.ID = 1
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, props)

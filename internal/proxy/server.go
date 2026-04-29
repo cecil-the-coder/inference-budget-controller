@@ -96,6 +96,7 @@ type Server struct {
 	Namespace       string // Default namespace to look for InferenceModels
 	ScaleUpTimeout  time.Duration
 	ReadyCheckDelay time.Duration
+	DefaultModel    string // Default model to use in web UI
 
 	// Memory-based scaling configuration
 	MaxModelMemory  string        // Maximum total memory for all running models (e.g., "96Gi")
@@ -162,6 +163,13 @@ func WithMaxModelMemory(maxMemory string) ServerOption {
 func WithEvictionMinIdle(d time.Duration) ServerOption {
 	return func(s *Server) {
 		s.EvictionMinIdle = d
+	}
+}
+
+// WithDefaultModel sets the default model for the web UI
+func WithDefaultModel(model string) ServerOption {
+	return func(s *Server) {
+		s.DefaultModel = model
 	}
 }
 

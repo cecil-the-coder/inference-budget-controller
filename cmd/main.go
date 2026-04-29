@@ -63,10 +63,12 @@ func main() {
 	var probeAddr string
 	var proxyAddr string
 	var proxyNamespace string
+	var defaultModel string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", ":9000", "The address the proxy server binds to.")
 	flag.StringVar(&proxyNamespace, "proxy-namespace", "inference", "The namespace to search for InferenceModels.")
+	flag.StringVar(&defaultModel, "default-model", "", "The default model to use in the web UI.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -194,6 +196,7 @@ func main() {
 		proxy.WithRegistry(deploymentRegistry),
 		proxy.WithMaxModelMemory(maxModelMemory),
 		proxy.WithEvictionMinIdle(evictionMinIdle),
+		proxy.WithDefaultModel(defaultModel),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

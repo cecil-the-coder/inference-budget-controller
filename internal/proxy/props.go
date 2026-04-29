@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -214,6 +215,12 @@ func (s *Server) propsHandler(c *gin.Context) {
 					// Model backend is running, set a non-zero ID to indicate "loaded"
 					props.DefaultGenerationSettings.ID = 1
 				}
+				// Set context size from model config
+				if model.Spec.Source.HuggingFace != nil && model.Spec.Source.HuggingFace.ContextSize != "" {
+					if ctxSize, err := strconv.Atoi(model.Spec.Source.HuggingFace.ContextSize); err == nil {
+						props.DefaultGenerationSettings.NCtx = ctxSize
+					}
+				}
 			}
 		}
 	} else {
@@ -227,6 +234,12 @@ func (s *Server) propsHandler(c *gin.Context) {
 			}, &model)
 			if err == nil && model.Status.Ready && model.Status.Replicas > 0 {
 				props.DefaultGenerationSettings.ID = 1
+			}
+			// Set context size from model config
+			if err == nil && model.Spec.Source.HuggingFace != nil && model.Spec.Source.HuggingFace.ContextSize != "" {
+				if ctxSize, err := strconv.Atoi(model.Spec.Source.HuggingFace.ContextSize); err == nil {
+					props.DefaultGenerationSettings.NCtx = ctxSize
+				}
 			}
 		}
 	}

@@ -205,6 +205,10 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/", s.webUIHandler.HandleIndex)
 	s.router.GET("/ui", s.webUIHandler.HandleIndex)
 	s.router.GET("/ui/*filepath", s.webUIHandler.HandleStatic)
+	// Static assets at root level (referenced by index.html as ./bundle.js, ./bundle.css)
+	s.router.GET("/bundle.js", s.webUIHandler.HandleStatic)
+	s.router.GET("/bundle.css", s.webUIHandler.HandleStatic)
+	s.router.GET("/loading.html", s.webUIHandler.HandleStatic)
 
 	// Server endpoints for llama.cpp web UI compatibility
 	s.router.GET("/props", s.propsHandler)

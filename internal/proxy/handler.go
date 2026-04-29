@@ -98,13 +98,28 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 			}
 		}
 
-		// Force reasoning_format to "none" to disable thinking/reasoning output
-		// Also set chat_template_kwargs to disable thinking in the model's chat template
+		// Disable thinking for Qwen3 models by:
+		// 1. Setting reasoning_format to "none"
+		// 2. Setting chat_template_kwargs enable_thinking to false
+		// 3. Adding /no_think to the last user message (Qwen3 specific)
 		var bodyMapForReasoning map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &bodyMapForReasoning); err == nil {
 			bodyMapForReasoning["reasoning_format"] = "none"
 			bodyMapForReasoning["chat_template_kwargs"] = map[string]interface{}{
 				"enable_thinking": false,
+			}
+			// Add /no_think to the last user message for Qwen3 models
+			if messages, ok := bodyMapForReasoning["messages"].([]interface{}); ok && len(messages) > 0 {
+				for i := len(messages) - 1; i >= 0; i-- {
+					if msg, ok := messages[i].(map[string]interface{}); ok {
+						if role, ok := msg["role"].(string); ok && role == "user" {
+							if content, ok := msg["content"].(string); ok {
+								msg["content"] = content + " /no_think"
+								break
+							}
+						}
+					}
+				}
 			}
 			if updatedBody, err := json.Marshal(bodyMapForReasoning); err == nil {
 				bodyBytes = updatedBody

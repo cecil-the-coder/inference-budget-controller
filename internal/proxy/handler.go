@@ -99,12 +99,10 @@ func (s *Server) openaiPassthroughHandler(backendPath string) gin.HandlerFunc {
 		}
 
 		// Disable thinking for Qwen3 models by:
-		// 1. Setting reasoning_format to "none"
-		// 2. Setting chat_template_kwargs enable_thinking to false
-		// 3. Adding a system message to disable thinking (Qwen3 specific)
+		// 1. Setting chat_template_kwargs enable_thinking to false
+		// Note: Do NOT set reasoning_format - testing showed it CAUSES thinking output!
 		var bodyMapForReasoning map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &bodyMapForReasoning); err == nil {
-			bodyMapForReasoning["reasoning_format"] = "none"
 			bodyMapForReasoning["chat_template_kwargs"] = map[string]interface{}{
 				"enable_thinking": false,
 			}

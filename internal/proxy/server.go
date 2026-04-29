@@ -102,6 +102,9 @@ type Server struct {
 	MaxMemoryBytes  int64         // Parsed max memory in bytes
 	EvictionMinIdle time.Duration // Minimum idle time before a model can be evicted for memory pressure
 
+	// Web UI handler
+	webUIHandler *WebUIHandler
+
 	server *http.Server
 	router *gin.Engine
 }
@@ -177,6 +180,7 @@ func NewServer(addr string, tracker *budget.Tracker, k8sClient client.Client, sc
 		Namespace:       "default",
 		ScaleUpTimeout:  5 * time.Minute,
 		ReadyCheckDelay: 2 * time.Second,
+		webUIHandler:    NewWebUIHandler(),
 		router:          router,
 	}
 
@@ -196,6 +200,15 @@ func (s *Server) setupRoutes() {
 
 	// Metrics endpoint - Prometheus metrics
 	s.router.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	// Web UI - llama.cpp chat interface
+	s.router.GET("/", s.webUIHandler.HandleIndex)
+	s.router.GET("/ui", s.webUIHandler.HandleIndex)
+	s.router.GET("/ui/*filepath", s.webUIHandler.HandleStatic)
+
+	// Server endpoints for llama.cpp web UI compatibility
+	s.router.GET("/props", s.propsHandler)
+	s.router.GET("/slots", s.slotsHandler)
 
 	// OpenAI-compatible API
 	v1 := s.router.Group("/v1")

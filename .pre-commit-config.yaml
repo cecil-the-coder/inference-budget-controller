@@ -12,6 +12,7 @@ repos:
       - id: check-case-conflict
       - id: check-added-large-files
         args: ['--maxkb=1000']
+        exclude: '^internal/proxy/webui/'
       - id: trailing-whitespace
         args: ['--markdown-linebreak-ext=md']
       - id: end-of-file-fixer

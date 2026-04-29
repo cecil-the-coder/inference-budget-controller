@@ -1479,6 +1479,11 @@ func (s *Server) buildPod(model *inferencev1alpha1.InferenceModel, backend *infe
 		Spec: podSpec,
 	}
 
+	// Set owner reference so the controller gets notified when pod status changes
+	if err := controllerutil.SetControllerReference(model, pod, s.Scheme); err != nil {
+		return nil, fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
 	return pod, nil
 }
 
